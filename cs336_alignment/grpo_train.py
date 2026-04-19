@@ -52,6 +52,12 @@ from cs336_alignment.grpo import (
     masked_mean,
     tokenize_prompt_and_output,
 )
+from cs336_alignment.vllm_utils import (
+    init_vllm,
+    load_policy_into_vllm_instance,
+    sleep_engine,
+    wake_engine,
+)
 
 
 REWARD_FNS = {
@@ -325,7 +331,7 @@ def main(
     epochs_per_rollout_batch: int = 1,
     train_batch_size: int = 256,
     gradient_accumulation_steps: int = 128,
-    gpu_memory_utilization: float = 0.85,
+    gpu_memory_utilization: float = 0.45,
     loss_type: str = typer.Option(
         "reinforce_with_baseline",
         help="One of {no_baseline, reinforce_with_baseline, grpo_clip}.",
@@ -351,8 +357,15 @@ def main(
         8,
         help="How many rollouts to surface in the wandb Table per logged step.",
     ),
-    train_device: str = "cuda:0",
-    vllm_device: str = "cuda:1",
+    device: str = typer.Option(
+        "cuda:0",
+        help=(
+            "GPU to colocate the trainer and the vLLM rollout engine on. "
+            "vLLM uses sleep/wake to release its GPU memory while the "
+            "trainer is doing fwd/bwd, so a single H200-class GPU is "
+            "enough for Qwen3-1.7B."
+        ),
+    ),
     save_every: Optional[int] = None,
     use_wandb: bool = True,
     wandb_project: str = "cs336-grpo",
@@ -458,8 +471,7 @@ def main(
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
     )
-    policy.to(train_device)
-    policy.gradient_checkpointing_enable()
+    policy.to(device)
     policy.train()
 
     optimizer = torch.optim.AdamW(
@@ -469,16 +481,19 @@ def main(
         betas=(0.9, 0.95),
     )
 
-    # ---------- vLLM rollout engine ---------- #
-    from cs336_alignment.vllm_utils import init_vllm, load_policy_into_vllm_instance
-
+    # ---------- vLLM rollout engine (colocated on `device`) ---------- #
+    # ``enable_sleep_mode`` lets us release vLLM's GPU memory between
+    # rollouts so the trainer has the full GPU for fwd/bwd.
     llm = init_vllm(
         model_id=model_id,
-        device=vllm_device,
+        device=device,
         seed=seed,
         gpu_memory_utilization=gpu_memory_utilization,
+        enable_sleep_mode=True,
     )
     load_policy_into_vllm_instance(policy, llm)
+    # Park vLLM right after init -- the first step will wake it before rollout.
+    sleep_engine(llm, level=1)
 
     # Stop on the closing answer tag for both raw r1_zero and the chat-mode
     # thinking models, so we never burn tokens past the answer.
@@ -516,7 +531,12 @@ def main(
         ground_truths = [_ground_truth_of(ex) for ex in batch_examples]
 
         # ---- 2. roll out with vLLM ---- #
+        # Wake the colocated vLLM engine, push the trainer's current weights
+        # into it, generate, then put the engine back to sleep so the
+        # trainer has exclusive GPU access for fwd/bwd.
         rollout_t0 = time.time()
+        wake_engine(llm)
+        load_policy_into_vllm_instance(policy, llm)
         sampled = vllm_generate(
             llm,
             prompt_strs,
@@ -527,6 +547,7 @@ def main(
             stop=stop,
             seed=seed + step,
         )
+        sleep_engine(llm, level=1)
         rollout_time = time.time() - rollout_t0
 
         # Flatten so contiguous chunks of `group_size` come from the same prompt.
@@ -558,7 +579,7 @@ def main(
         need_old = (loss_type == "grpo_clip") or (epochs_per_rollout_batch > 1)
         if need_old:
             old_log_probs = compute_old_log_probs(
-                policy, tokenized, micro_train_batch_size, torch.device(train_device)
+                policy, tokenized, micro_train_batch_size, torch.device(device)
             )
         else:
             old_log_probs = None
@@ -587,9 +608,9 @@ def main(
                 for micro in build_microbatches(
                     tokenized_tb, adv_tb, raw_tb, old_tb, micro_train_batch_size
                 ):
-                    input_ids = micro["input_ids"].to(train_device)
-                    labels = micro["labels"].to(train_device)
-                    response_mask = micro["response_mask"].to(train_device)
+                    input_ids = micro["input_ids"].to(device)
+                    labels = micro["labels"].to(device)
+                    response_mask = micro["response_mask"].to(device)
 
                     fwd = get_response_log_probs(
                         policy, input_ids, labels, return_token_entropy=True
@@ -597,10 +618,10 @@ def main(
                     log_probs = fwd["log_probs"]
                     token_entropy = fwd["token_entropy"]
 
-                    raw_kw = micro["raw_rewards"].to(train_device).unsqueeze(-1)
-                    adv_kw = micro["advantages"].to(train_device).unsqueeze(-1)
+                    raw_kw = micro["raw_rewards"].to(device).unsqueeze(-1)
+                    adv_kw = micro["advantages"].to(device).unsqueeze(-1)
                     old_kw = (
-                        micro["old_log_probs"].to(train_device)
+                        micro["old_log_probs"].to(device)
                         if "old_log_probs" in micro
                         else None
                     )
@@ -632,8 +653,10 @@ def main(
 
         train_time = time.time() - train_t0
 
-        # ---- 7. push fresh weights into vLLM ---- #
-        load_policy_into_vllm_instance(policy, llm)
+        # ---- 7. (no separate weight sync here) ---- #
+        # vLLM is asleep. The next iteration's rollout phase will wake it
+        # and call ``load_policy_into_vllm_instance`` with the freshly
+        # updated policy weights.
 
         avg_loss = loss_running / max(n_micro, 1)
         avg_entropy = entropy_running / max(n_micro, 1)
@@ -711,6 +734,10 @@ def main(
         # ---- 9. validation ---- #
         if eval_every > 0 and (step % eval_every == 0 or step == n_grpo_steps - 1):
             eval_t0 = time.time()
+            # vLLM is asleep after the rollout phase; wake it for eval
+            # generation, then put it back so training memory is reclaimed.
+            wake_engine(llm)
+            load_policy_into_vllm_instance(policy, llm)
             val_metrics = evaluate(
                 llm,
                 val_examples,
@@ -722,6 +749,7 @@ def main(
                 stop=stop,
                 max_examples=eval_examples,
             )
+            sleep_engine(llm, level=1)
             val_metrics["time/eval_s"] = time.time() - eval_t0
             metrics.update(val_metrics)
 

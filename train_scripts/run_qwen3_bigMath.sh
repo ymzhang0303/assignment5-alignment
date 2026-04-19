@@ -62,7 +62,8 @@ uv run python -m cs336_alignment.grpo_train \
     --prompt-name "$PROMPT_NAME" \
     $THINKING_FLAG \
     --reward-fn-name r1_zero_thinking \
-    --train-device cuda:0 --vllm-device cuda:1 \
+    --device "${DEVICE:-cuda:0}" \
+    --gpu-memory-utilization "${GPU_MEM_UTIL:-0.45}" \
     --n-grpo-steps "$N_GRPO_STEPS" \
     --learning-rate "$LR" \
     --rollout-batch-size "$ROLLOUT_BATCH_SIZE" \

@@ -14,7 +14,8 @@ uv run python -m cs336_alignment.grpo_train \
     --train-path data/dapo_math/train.jsonl \
     --val-path  data/dapo_math/validation.jsonl \
     --output-dir runs/grpo_dapo \
-    --train-device cuda:0 --vllm-device cuda:1 \
+    --device "${DEVICE:-cuda:0}" \
+    --gpu-memory-utilization "${GPU_MEM_UTIL:-0.45}" \
     --use-wandb \
     --wandb-project "$WANDB_PROJECT" \
     --wandb-run-name "$WANDB_RUN_NAME" \
