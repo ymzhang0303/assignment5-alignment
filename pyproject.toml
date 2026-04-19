@@ -15,11 +15,12 @@ dependencies = [
     "pytest>=8.3.5",
     "torch",
     "tqdm>=4.67.1",
-    "transformers>=4.50.0",
+    "transformers>=4.51.3,<5.0.0",
     "typer>=0.15.4",
-    "vllm==0.7.2",
+    "vllm>=0.8.5,<0.9.0",
     "wandb>=0.19.8",
     "xopen>=2.0.2",
+    "datasets>=2.18",
 ]
 
 [tool.setuptools.packages.find]

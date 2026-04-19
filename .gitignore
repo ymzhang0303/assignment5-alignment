@@ -5,6 +5,17 @@ data/
 nav
 tags
 
+# Training run artifacts (configs, rollouts, metrics, checkpoints, wandb logs)
+runs/
+wandb/
+*.ckpt
+*.safetensors
+
+# Editor / OS
+*.swp
+*.swo
+.DS_Store
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

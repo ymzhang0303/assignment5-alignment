@@ -1047,6 +1047,58 @@ def r1_zero_reward_fn(response, ground_truth, fast=True):
         }
 
 
+_THINK_ANSWER_RE = re.compile(
+    r"</think>\s*<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE
+)
+_ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
+
+
+def r1_zero_thinking_reward_fn(response, ground_truth, fast=True):
+    """Reward function for native thinking models (e.g. Qwen3).
+
+    Same shape as ``r1_zero_reward_fn`` but tolerant of whitespace/newlines
+    between the ``</think>`` block and the ``<answer>...</answer>`` block,
+    which is what models post-trained with native thinking emit.
+
+    Format reward (1.0) is granted iff:
+      * the response contains a ``</think>`` followed (after any whitespace)
+        by a properly closed ``<answer>...</answer>`` block, OR
+      * the response simply contains a properly closed ``<answer>...</answer>``
+        block (which is what we get when the chat template already emits the
+        closing ``</think>`` itself, e.g. Qwen3 with ``enable_thinking=False``).
+
+    The answer reward (1.0) is granted iff the extracted answer matches the
+    ground truth via the same grader as ``r1_zero_reward_fn``.
+    """
+    m = _THINK_ANSWER_RE.search(response)
+    if m is None:
+        # No </think>...<answer>...</answer> sequence in the response.
+        # Fall back to a bare <answer>...</answer> match for the case where
+        # the </think> closing tag is part of the prompt (non-thinking mode).
+        m = _ANSWER_RE.search(response)
+        if m is None:
+            return {"format_reward": 0.0, "answer_reward": 0.0, "reward": 0.0}
+    model_answer = m.group(1).strip()
+    if "\\boxed" in model_answer:
+        boxed = extract_answer(model_answer)
+        if boxed is None:
+            return {"format_reward": 1.0, "answer_reward": 0.0, "reward": 0.0}
+        model_answer = boxed
+    if isinstance(ground_truth, (float, int)):
+        ground_truth = str(ground_truth)
+    if isinstance(ground_truth, str):
+        is_correct = grade(model_answer, ground_truth, fast)
+    elif isinstance(ground_truth, list):
+        is_correct = False
+        for gt in ground_truth:
+            is_correct |= grade(model_answer, gt, fast)
+    else:
+        is_correct = False
+    if is_correct:
+        return {"format_reward": 1.0, "answer_reward": 1.0, "reward": 1.0}
+    return {"format_reward": 1.0, "answer_reward": 0.0, "reward": 0.0}
+
+
 def question_only_reward_fn(response, ground_truth, fast=True):
     model_answer = extract_answer(response)
     if model_answer is None:
