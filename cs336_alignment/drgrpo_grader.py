@@ -759,10 +759,74 @@ def _strip_properly_formatted_commas(expr: str):
     return next_expr
 
 
+# Unicode math character aliases that we want to fold into ASCII before
+# any structural normalization. Models frequently emit these (especially
+# Unicode superscripts for scientific notation like ``1.656×10⁶``) and we
+# don't want them to count as wrong simply because the ground truth uses
+# the LaTeX-style ``1.656\times 10^{6}`` / ``1.656×10^{6}`` rendering.
+_UNICODE_SUPERSCRIPTS = {
+    "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+    "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+    "⁺": "+", "⁻": "-", "⁼": "=", "⁽": "(", "⁾": ")",
+}
+_UNICODE_SUBSCRIPTS = {
+    "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
+    "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9",
+    "₊": "+", "₋": "-", "₌": "=", "₍": "(", "₎": ")",
+}
+
+
+def _fold_unicode_math(expr: str) -> str:
+    """Replace common Unicode math glyphs with their ASCII equivalents."""
+    # Multiplication / minus signs.
+    expr = expr.replace("×", "*").replace("·", "*").replace("−", "-")
+    # Superscripts: collapse a run of Unicode superscript chars into ``^{...}``.
+    if any(ch in expr for ch in _UNICODE_SUPERSCRIPTS):
+        out = []
+        i = 0
+        while i < len(expr):
+            ch = expr[i]
+            if ch in _UNICODE_SUPERSCRIPTS:
+                j = i
+                buf = []
+                while j < len(expr) and expr[j] in _UNICODE_SUPERSCRIPTS:
+                    buf.append(_UNICODE_SUPERSCRIPTS[expr[j]])
+                    j += 1
+                out.append("^{" + "".join(buf) + "}")
+                i = j
+            else:
+                out.append(ch)
+                i += 1
+        expr = "".join(out)
+    # Subscripts: same idea but rendered as ``_{...}``.
+    if any(ch in expr for ch in _UNICODE_SUBSCRIPTS):
+        out = []
+        i = 0
+        while i < len(expr):
+            ch = expr[i]
+            if ch in _UNICODE_SUBSCRIPTS:
+                j = i
+                buf = []
+                while j < len(expr) and expr[j] in _UNICODE_SUBSCRIPTS:
+                    buf.append(_UNICODE_SUBSCRIPTS[expr[j]])
+                    j += 1
+                out.append("_{" + "".join(buf) + "}")
+                i = j
+            else:
+                out.append(ch)
+                i += 1
+        expr = "".join(out)
+    return expr
+
+
 def _normalize(expr: str) -> str:
     """Normalize answer expressions."""
     if expr is None:
         return None
+
+    # Fold Unicode math glyphs (×, ·, −, superscripts, subscripts) into ASCII
+    # so downstream string/sympy comparisons see a canonical form.
+    expr = _fold_unicode_math(expr)
 
     # Remove enclosing `\text{}`.
     m = re.search("^\\\\text\{(?P<text>.+?)\}$", expr)
