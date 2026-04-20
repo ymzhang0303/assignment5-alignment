@@ -1,0 +1,123 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "SDPO: run_sdpo.sh (debug)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "cs336_alignment.sdpo_train",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "env": {
+                "WANDB_MODE": "disabled",
+                "WANDB_PROJECT": "cs336-sdpo",
+                "WANDB_RUN_NAME": "sdpo_debug"
+            },
+            "args": [
+                "--model-id", "/root/assignment5-alignment/models/Qwen3-1.7B",
+                "--train-path", "data/big_math/train.jsonl",
+                "--val-path", "data/big_math/validation.jsonl",
+                "--output-dir", "runs/sdpo_debug",
+                "--prompt-format", "chat",
+                "--prompt-name", "qwen3_thinking",
+                "--enable-thinking",
+                "--reward-fn-name", "r1_zero_thinking",
+                "--device", "cuda:0",
+                "--gpu-memory-utilization", "0.45",
+                // debugpy's sys.monitoring tracer crashes vLLM's torch.compile
+                // graphs ("Unsupported: generator" inside dynamo). Force
+                // eager-mode rollouts for the debug session.
+                "--enforce-eager",
+                // Tiny shapes so a step finishes in seconds, not minutes.
+                "--n-grpo-steps", "2",
+                "--rollout-batch-size", "4",
+                "--group-size", "4",
+                "--train-batch-size", "4",
+                "--gradient-accumulation-steps", "1",
+                "--sampling-max-tokens", "2048",
+                "--epochs-per-rollout-batch", "1",
+                "--learning-rate", "1e-5",
+                "--pg-loss-type", "grpo_clip",
+                "--pg-loss-weight", "0.0",
+                "--sdpo-alpha", "0.5",
+                "--distillation-topk", "100",
+                "--is-clip", "2.0",
+                "--success-reward-threshold", "1.0",
+                "--teacher-update-rate", "1.0",
+                "--dont-reprompt-on-self-success",
+                "--use-std-normalization",
+                "--eval-every", "0",
+                "--eval-examples", "8",
+                "--no-log-all-rollouts",
+                "--log-examples-every", "1",
+                "--n-log-examples", "2",
+                "--no-use-wandb",
+                "--wandb-mode", "disabled"
+            ]
+        },
+        {
+            "name": "SDPO: run_sdpo.sh (full config)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "cs336_alignment.sdpo_train",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "env": {
+                "WANDB_MODE": "online",
+                "WANDB_PROJECT": "cs336-sdpo",
+                "WANDB_RUN_NAME": "sdpo_qwen3_bigmath_debug"
+            },
+            // Mirrors the env-driven defaults inside train_scripts/sdpo/run_sdpo.sh.
+            "args": [
+                "--model-id", "/root/assignment5-alignment/models/Qwen3-1.7B",
+                "--train-path", "data/big_math/train.jsonl",
+                "--val-path", "data/big_math/validation.jsonl",
+                "--output-dir", "runs/sdpo_qwen3_bigmath",
+                "--prompt-format", "chat",
+                "--prompt-name", "qwen3_thinking",
+                "--enable-thinking",
+                "--reward-fn-name", "r1_zero_thinking",
+                "--device", "cuda:0",
+                "--gpu-memory-utilization", "0.45",
+                "--n-grpo-steps", "200",
+                "--learning-rate", "1e-5",
+                "--rollout-batch-size", "128",
+                "--group-size", "8",
+                "--train-batch-size", "128",
+                "--gradient-accumulation-steps", "64",
+                "--sampling-max-tokens", "1536",
+                "--epochs-per-rollout-batch", "1",
+                "--pg-loss-type", "grpo_clip",
+                "--pg-loss-weight", "0.0",
+                "--sdpo-alpha", "0.5",
+                "--distillation-topk", "100",
+                "--is-clip", "2.0",
+                "--success-reward-threshold", "1.0",
+                "--teacher-update-rate", "1.0",
+                "--dont-reprompt-on-self-success",
+                "--use-std-normalization",
+                "--eval-every", "5",
+                "--eval-examples", "256",
+                "--log-all-rollouts",
+                "--log-examples-every", "1",
+                "--n-log-examples", "8",
+                "--use-wandb",
+                "--wandb-project", "cs336-sdpo",
+                "--wandb-run-name", "sdpo_qwen3_bigmath_debug",
+                "--wandb-mode", "online"
+            ]
+        }
+    ]
+}

@@ -12,12 +12,12 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-export WANDB_API_KEY="${WANDB_API_KEY:-}"
+export WANDB_API_KEY="${WANDB_API_KEY:-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}"
 export WANDB_PROJECT="${WANDB_PROJECT:-cs336-sdpo}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 
 LR="${LR:-1e-5}"
-DEVICE="${DEVICE:-cuda:0}"
+DEVICE="${DEVICE:-cuda:7}"
 OUTPUT_DIR="${OUTPUT_DIR:-runs/sdpo_qwen3_bigmath}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-sdpo_qwen3_bigmath}"
 export WANDB_RUN_NAME
@@ -70,6 +70,33 @@ case "$DONT_REPROMPT_ON_SELF_SUCCESS" in
     *) echo "DONT_REPROMPT_ON_SELF_SUCCESS must be 0/1" >&2; exit 1 ;;
 esac
 
+REMOVE_THINKING_FROM_DEMO="${REMOVE_THINKING_FROM_DEMO:-1}"
+case "$REMOVE_THINKING_FROM_DEMO" in
+    1|true|True|TRUE|yes|on)  RTFD_FLAG="--remove-thinking-from-demonstration" ;;
+    0|false|False|FALSE|no|off) RTFD_FLAG="--no-remove-thinking-from-demonstration" ;;
+    *) echo "REMOVE_THINKING_FROM_DEMO must be 0/1" >&2; exit 1 ;;
+esac
+
+MIN_DEMO_THINKING_CHARS="${MIN_DEMO_THINKING_CHARS:-0}"
+
+PG_APPLY_TO_ALL_SAMPLES="${PG_APPLY_TO_ALL_SAMPLES:-0}"
+case "$PG_APPLY_TO_ALL_SAMPLES" in
+    1|true|True|TRUE|yes|on)  PG_ALL_FLAG="--pg-apply-to-all-samples" ;;
+    0|false|False|FALSE|no|off) PG_ALL_FLAG="--no-pg-apply-to-all-samples" ;;
+    *) echo "PG_APPLY_TO_ALL_SAMPLES must be 0/1" >&2; exit 1 ;;
+esac
+
+# Optional reprompt-template overrides (set REPROMPT_TEMPLATE / SOLUTION_TEMPLATE
+# to non-empty strings to override the SDPO defaults). The defaults live in
+# cs336_alignment/sdpo.py.
+EXTRA_REPROMPT_FLAGS=()
+if [[ -n "${REPROMPT_TEMPLATE:-}" ]]; then
+    EXTRA_REPROMPT_FLAGS+=(--reprompt-template "$REPROMPT_TEMPLATE")
+fi
+if [[ -n "${SOLUTION_TEMPLATE:-}" ]]; then
+    EXTRA_REPROMPT_FLAGS+=(--solution-template "$SOLUTION_TEMPLATE")
+fi
+
 mkdir -p "$OUTPUT_DIR"
 
 uv run python -m cs336_alignment.sdpo_train \
@@ -99,6 +126,10 @@ uv run python -m cs336_alignment.sdpo_train \
     --success-reward-threshold "$SUCCESS_THRESHOLD" \
     --teacher-update-rate "$TEACHER_UPDATE_RATE" \
     $DROSS_FLAG \
+    $RTFD_FLAG \
+    --min-demo-thinking-chars "$MIN_DEMO_THINKING_CHARS" \
+    $PG_ALL_FLAG \
+    "${EXTRA_REPROMPT_FLAGS[@]}" \
     "$STD_NORM_FLAG" \
     --eval-every "$EVAL_EVERY" \
     --eval-examples "$EVAL_EXAMPLES" \

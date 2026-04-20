@@ -264,6 +264,16 @@ def main(
     train_batch_size: int = 256,
     gradient_accumulation_steps: int = 128,
     gpu_memory_utilization: float = 0.45,
+    enforce_eager: bool = typer.Option(
+        False,
+        help=(
+            "Disable vLLM's torch.compile graphs and run the rollout model "
+            "in eager mode. Required when running under debugpy (debugpy's "
+            "PEP 669 sys.monitoring tracer triggers a 'generator' "
+            "Unsupported error inside dynamo's frame eval) and useful when "
+            "iterating on the trainer code itself."
+        ),
+    ),
     use_std_normalization: bool = True,
     pg_loss_type: str = typer.Option(
         "grpo_clip",
@@ -319,6 +329,46 @@ def main(
     ),
     remove_thinking_from_demonstration: bool = typer.Option(
         True, help="Strip <think>...</think> from demonstrations."
+    ),
+    min_demo_thinking_chars: int = typer.Option(
+        0,
+        help=(
+            "Reject successful demonstrations whose <think>...</think> "
+            "content has fewer than this many non-whitespace chars. "
+            "Setting >0 (e.g. 64) prevents the SDPO collapse mode where a "
+            "rollout that emits '<think></think><answer>X</answer>' and "
+            "happens to guess the right answer becomes the demo for its "
+            "siblings, training the teacher to also skip thinking."
+        ),
+    ),
+    pg_apply_to_all_samples: bool = typer.Option(
+        False,
+        help=(
+            "If True, apply the optional GRPO-style PG term to every "
+            "rollout (not just the ones without a teacher signal). "
+            "Useful for 'GRPO with KL distillation regulariser' setups; "
+            "increases the effective scalar reward signal that anchors "
+            "the policy to correct answers, which empirically prevents "
+            "the SDPO collapse-to-no-thinking failure."
+        ),
+    ),
+    reprompt_template: Optional[str] = typer.Option(
+        None,
+        help=(
+            "Override the reprompt template fed to the teacher. Must contain "
+            "the literal placeholders '{prompt}', '{solution}', '{feedback}'. "
+            "Defaults to the SDPO paper's template "
+            "('{prompt}{solution}{feedback}\\n\\nCorrectly solve the original "
+            "question.'). Use this to e.g. force the teacher to explicitly "
+            "produce a thinking trace before answering."
+        ),
+    ),
+    solution_template: Optional[str] = typer.Option(
+        None,
+        help=(
+            "Override the solution sub-template (rendered into '{solution}'). "
+            "Must contain '{successful_previous_attempt}'."
+        ),
     ),
     teacher_regularization: str = typer.Option(
         "ema",
@@ -491,6 +541,7 @@ def main(
         device=device,
         seed=seed,
         gpu_memory_utilization=gpu_memory_utilization,
+        enforce_eager=enforce_eager,
         enable_sleep_mode=True,
     )
     load_policy_into_vllm_instance(policy, llm)
@@ -602,15 +653,18 @@ def main(
                         success_reward_threshold=success_reward_threshold,
                         dont_reprompt_on_self_success=dont_reprompt_on_self_success,
                         remove_thinking_from_demonstration=remove_thinking_from_demonstration,
+                        min_demo_thinking_chars=min_demo_thinking_chars,
                     )
                 )
 
+        active_reprompt_tmpl = reprompt_template or DEFAULT_REPROMPT_TEMPLATE
+        active_solution_tmpl = solution_template or DEFAULT_SOLUTION_TEMPLATE
         reprompted_user_strs, has_signal = build_reprompts(
             repeated_user_questions,
             demos,
             feedbacks=None,  # math task has no rich environment feedback
-            reprompt_template=DEFAULT_REPROMPT_TEMPLATE,
-            solution_template=DEFAULT_SOLUTION_TEMPLATE,
+            reprompt_template=active_reprompt_tmpl,
+            solution_template=active_solution_tmpl,
             feedback_template=DEFAULT_FEEDBACK_TEMPLATE,
         )
         repeated_teacher_prompts = teacher_prompt_renderer(reprompted_user_strs)
@@ -848,6 +902,7 @@ def main(
                         teacher_all_log_probs=t_all,
                         pg_loss=pg_loss_per_token,
                         pg_loss_weight=pg_loss_weight,
+                        pg_apply_to_all_samples=pg_apply_to_all_samples,
                     )
 
                     loss_running += float(loss.detach().item()) * gradient_accumulation_steps

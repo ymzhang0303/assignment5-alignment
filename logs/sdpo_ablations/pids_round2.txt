@@ -1,0 +1,3 @@
+266787 fix_d_pg_mix cuda:2
+266788 fix_e_pg_all cuda:3
+266789 fix_f_min_demo cuda:7

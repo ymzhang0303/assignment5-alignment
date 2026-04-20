@@ -1,0 +1,3 @@
+254367 fix_a_keep_thinking cuda:2
+254368 fix_b_force_reason cuda:3
+254369 fix_c_both cuda:7

@@ -60,6 +60,7 @@ import torch.nn.functional as F
 
 
 _THINKING_RE = re.compile(r"<think>.*?</think>\s*", flags=re.DOTALL)
+_THINKING_CONTENT_RE = re.compile(r"<think>(.*?)</think>", flags=re.DOTALL)
 
 
 def remove_thinking_trace(text: str) -> str:
@@ -73,6 +74,17 @@ def remove_thinking_trace(text: str) -> str:
     return _THINKING_RE.sub("", text)
 
 
+def thinking_content_chars(text: str) -> int:
+    """Return the total non-whitespace char count inside ``<think>...</think>``.
+
+    Used by :func:`pick_successful_demo` to filter out demos whose chain of
+    thought is empty or trivial (e.g. ``<think></think>``), which would
+    otherwise teach the student to skip thinking entirely.
+    """
+    matches = _THINKING_CONTENT_RE.findall(text)
+    return sum(len(m.strip()) for m in matches)
+
+
 def pick_successful_demo(
     group_rewards: list[float],
     group_responses: list[str],
@@ -81,6 +93,7 @@ def pick_successful_demo(
     success_reward_threshold: float = 1.0,
     dont_reprompt_on_self_success: bool = True,
     remove_thinking_from_demonstration: bool = True,
+    min_demo_thinking_chars: int = 0,
 ) -> Optional[str]:
     """Choose a successful demonstration from a rollout group.
 
@@ -109,6 +122,18 @@ def pick_successful_demo(
     ]
     if dont_reprompt_on_self_success:
         candidate_idxs = [j for j in candidate_idxs if j != self_idx]
+    if min_demo_thinking_chars > 0:
+        # Reject demos whose <think>...</think> is shorter than the
+        # threshold. Without this, a successful no-think rollout (e.g.
+        # '<think></think><answer>X</answer>' that happened to guess the
+        # right number) becomes a demo that pushes the teacher toward
+        # "skip thinking" behaviour -- exactly the collapse mode we saw
+        # in the baseline SDPO run.
+        candidate_idxs = [
+            j
+            for j in candidate_idxs
+            if thinking_content_chars(group_responses[j]) >= min_demo_thinking_chars
+        ]
     if not candidate_idxs:
         return None
     # The verl reference picks index 0 of the success list. Because rollouts
@@ -476,6 +501,7 @@ def sdpo_microbatch_train_step(
     teacher_all_log_probs: Optional[torch.Tensor] = None,
     pg_loss: Optional[torch.Tensor] = None,
     pg_loss_weight: float = 0.0,
+    pg_apply_to_all_samples: bool = False,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """One microbatch fwd+bwd for SDPO.
 
@@ -483,8 +509,13 @@ def sdpo_microbatch_train_step(
     intersection of ``response_mask`` and ``self_distillation_mask`` (the
     latter zeroes out rollouts with no teacher signal). Optionally mixes in
     a precomputed per-token policy-gradient loss ``pg_loss`` weighted by
-    ``pg_loss_weight`` -- useful when you want non-distilled samples to
-    still get a GRPO-style update instead of contributing zero gradient.
+    ``pg_loss_weight``.
+
+    By default the PG term is restricted to *non-distilled* samples (so the
+    KL term and the PG term don't both push on the same tokens). Set
+    ``pg_apply_to_all_samples=True`` to apply PG to every rollout -- useful
+    when the goal is "GRPO with an auxiliary distillation regulariser"
+    rather than "pure SDPO with a fallback gradient on no-demo samples".
     """
     per_token_distill, distill_meta = compute_self_distillation_loss(
         student_log_probs=student_log_probs,
@@ -504,13 +535,14 @@ def sdpo_microbatch_train_step(
     total = distill_loss
     pg_term = torch.tensor(0.0, device=distill_loss.device, dtype=distill_loss.dtype)
     if pg_loss is not None and pg_loss_weight != 0.0:
-        # Apply the PG loss only on samples that *don't* have a teacher
-        # signal -- otherwise the distillation loss already provides the
-        # gradient and stacking PG on top wastes signal / fights it.
-        if self_distillation_mask is not None:
+        if self_distillation_mask is not None and not pg_apply_to_all_samples:
+            # Default: PG only on samples without a teacher signal so KL and
+            # PG don't fight on the same tokens.
             non_distill = (1.0 - self_distillation_mask.to(pg_loss.dtype)).unsqueeze(1)
             pg_mask = response_mask.to(pg_loss.dtype) * non_distill
         else:
+            # Either no per-sample mask, or the user explicitly asked for
+            # PG on every rollout (GRPO-with-KL-regulariser mode).
             pg_mask = response_mask.to(pg_loss.dtype)
         pg_term = _masked_mean(pg_loss, pg_mask)
         total = distill_loss + pg_loss_weight * pg_term
