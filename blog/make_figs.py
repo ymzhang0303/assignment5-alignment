@@ -177,6 +177,135 @@ fig.tight_layout()
 fig.savefig(OUT / "lr1e4_collapse.png")
 plt.close(fig)
 
+# ---- Fig 6: baseline vs no-baseline (loss_type ablation, on-policy) ----------
+BL_RUNS = {
+    "reinforce_with_baseline": REPO_ROOT / "runs/grpo_qwen3_bigmath_reinforce_bl/metrics.jsonl",
+    "no_baseline":             REPO_ROOT / "runs/grpo_qwen3_bigmath_no_baseline/metrics.jsonl",
+}
+BL_COLORS = {
+    "reinforce_with_baseline": "#55a868",
+    "no_baseline":             "#c44e52",
+}
+BL_DATA = {k: load(p) for k, p in BL_RUNS.items()}
+
+fig, axes = plt.subplots(2, 3, figsize=(13, 6.5), sharex=True)
+bl_panels = [
+    ("val/answer_reward",          "val answer reward",            False, None),
+    ("val/format_reward",          "val format reward",            False, None),
+    ("val/response_chars",         "val response length (chars)",  False, 1536),
+    ("train/grad_norm",            "train grad_norm (post-clip)",  True,  1.0),
+    ("train/group_reward_std_mean","group reward std (signal)",    True,  None),
+    ("train/token_entropy",        "policy entropy",               True,  None),
+]
+for ax, (key, title, do_smooth, hline) in zip(axes.flat, bl_panels):
+    for name, rows in BL_DATA.items():
+        xs, ys = col(rows, key)
+        if not xs:
+            continue
+        ys_plot = smooth(ys, 5) if do_smooth else ys
+        ax.plot(xs, ys_plot, lw=1.6, color=BL_COLORS[name], label=name)
+    ax.set_title(title)
+    ax.grid(alpha=0.3)
+    if hline is not None:
+        ax.axhline(hline, color="gray", ls=":", lw=1)
+    if key == "train/grad_norm":
+        ax.set_yscale("log")
+for ax in axes[-1]:
+    ax.set_xlabel("GRPO step")
+axes[0, 0].legend(loc="lower right", frameon=False, fontsize=8)
+fig.suptitle("Baseline vs no-baseline at lr=1e-5 (everything else identical)",
+             fontsize=12, y=1.0)
+fig.tight_layout()
+fig.savefig(OUT / "baseline_compare.png")
+plt.close(fig)
+
+
+# ---- Fig 7: length normalization (masked_mean vs Dr-GRPO masked_normalize) ---
+LN_RUNS = {
+    "masked_mean (vanilla GRPO)":       REPO_ROOT / "runs/grpo_qwen3_bigmath_reinforce_bl/metrics.jsonl",
+    "masked_normalize (Dr-GRPO, L=1536)": REPO_ROOT / "runs/grpo_qwen3_bigmath_reinforce_bl_drnorm/metrics.jsonl",
+}
+LN_COLORS = {
+    "masked_mean (vanilla GRPO)":         "#55a868",
+    "masked_normalize (Dr-GRPO, L=1536)": "#4c72b0",
+}
+LN_DATA = {k: load(p) for k, p in LN_RUNS.items()}
+
+fig, axes = plt.subplots(2, 3, figsize=(13, 6.5), sharex=True)
+ln_panels = [
+    ("val/answer_reward",          "val answer reward",            False, None),
+    ("val/response_chars",         "val response length (chars)",  False, 1536),
+    ("train/grad_norm",            "train grad_norm (post-clip)",  True,  1.0),
+    ("train/loss",                 "train loss (per micro-batch)", True,  0.0),
+    ("train/token_entropy",        "policy entropy",               True,  None),
+    ("train/group_reward_std_mean","group reward std (signal)",    True,  None),
+]
+for ax, (key, title, do_smooth, hline) in zip(axes.flat, ln_panels):
+    for name, rows in LN_DATA.items():
+        xs, ys = col(rows, key)
+        if not xs:
+            continue
+        ys_plot = smooth(ys, 5) if do_smooth else ys
+        ax.plot(xs, ys_plot, lw=1.6, color=LN_COLORS[name], label=name)
+    ax.set_title(title)
+    ax.grid(alpha=0.3)
+    if hline is not None:
+        ax.axhline(hline, color="gray", ls=":", lw=1)
+for ax in axes[-1]:
+    ax.set_xlabel("GRPO step")
+axes[0, 0].legend(loc="lower right", frameon=False, fontsize=8)
+fig.suptitle(
+    "Length normalization at lr=1e-5 + reinforce_with_baseline (everything else identical)",
+    fontsize=12, y=1.0,
+)
+fig.tight_layout()
+fig.savefig(OUT / "length_norm_compare.png")
+plt.close(fig)
+
+
+# ---- Fig 8: std-norm ON vs OFF (advantage normalization ablation) ------------
+SN_RUNS = {
+    "use_std_normalization=True":  REPO_ROOT / "runs/grpo_qwen3_bigmath_reinforce_bl/metrics.jsonl",
+    "use_std_normalization=False": REPO_ROOT / "runs/grpo_qwen3_bigmath_reinforce_bl_no_std/metrics.jsonl",
+}
+SN_COLORS = {
+    "use_std_normalization=True":  "#55a868",
+    "use_std_normalization=False": "#dd8452",
+}
+SN_DATA = {k: load(p) for k, p in SN_RUNS.items()}
+
+fig, axes = plt.subplots(2, 3, figsize=(13, 6.5), sharex=True)
+sn_panels = [
+    ("val/answer_reward",          "val answer reward",            False, None),
+    ("val/response_chars",         "val response length (chars)",  False, 1536),
+    ("train/grad_norm",            "train grad_norm (post-clip)",  True,  1.0),
+    ("train/token_entropy",        "policy entropy",               True,  None),
+    ("train/group_reward_std_mean","group reward std (signal)",    True,  None),
+    ("train/loss",                 "train loss (per micro-batch)", True,  0.0),
+]
+for ax, (key, title, do_smooth, hline) in zip(axes.flat, sn_panels):
+    for name, rows in SN_DATA.items():
+        xs, ys = col(rows, key)
+        if not xs:
+            continue
+        ys_plot = smooth(ys, 5) if do_smooth else ys
+        ax.plot(xs, ys_plot, lw=1.6, color=SN_COLORS[name], label=name)
+    ax.set_title(title)
+    ax.grid(alpha=0.3)
+    if hline is not None:
+        ax.axhline(hline, color="gray", ls=":", lw=1)
+for ax in axes[-1]:
+    ax.set_xlabel("GRPO step")
+axes[0, 0].legend(loc="lower right", frameon=False, fontsize=8)
+fig.suptitle(
+    "Group-std normalization on vs off at lr=1e-5 + reinforce_with_baseline",
+    fontsize=12, y=1.0,
+)
+fig.tight_layout()
+fig.savefig(OUT / "std_norm_compare.png")
+plt.close(fig)
+
+
 print("wrote:")
 for f in sorted(OUT.glob("*.png")):
     print(" ", f.relative_to(REPO_ROOT))

@@ -56,41 +56,104 @@ Three secondary metrics tell the same overcooking story for `3e-5`:
 
 The takeaway: **the safe LR isn't the one that climbs fastest — it's the one whose curves stay monotone late in training**. If we'd stopped at step 90 we would have called `3e-5` the best, kept it, and been wrong.
 
-## Format is learned much faster than answer correctness
 
-Because reward is binary `{0, 1}` and gated on both the `</think>...<answer>...</answer>` wrapping *and* the math being right, we can split val performance into "got the format right" and "got the answer right" components:
+## Effect of the baseline: `no_baseline` vs `reinforce_with_baseline`
 
-![Format vs answer reward](figs/format_vs_answer.png)
+The `1e-5` winner above used `loss_type=reinforce_with_baseline`, where the per-token advantage is `(reward − group_mean_reward) / group_std`. The natural ablation is to drop the per-group mean subtraction entirely (`loss_type=no_baseline`, advantage is just the std-normalized reward) and see what the baseline was actually buying us. We re-ran the exact `1e-5` recipe — same model, same data, same hyperparameters, same seed, only `loss_type` flipped — for 200 GRPO steps.
 
-Across all healthy runs the format reward (solid lines) jumps fast and saturates well before the answer reward (dashed lines). At the end:
+![Baseline vs no-baseline](figs/baseline_compare.png)
 
-- 1e-5: format 0.81, answer 0.64 (gap 0.17)
-- 3e-5: format 0.72, answer 0.39 (gap 0.33 — gap *grew* as the policy degraded)
-- 3e-6: format 0.63, answer 0.47 (gap 0.16, but both still rising)
+Headline: **no-baseline catastrophically collapses around step 140**, even at the LR that was rock-solid with the baseline.
 
-This "first learn the protocol, then learn the math" curriculum shows up across every reasonable LR and is a useful sanity check — if format isn't crossing 0.6 quickly something is structurally wrong (template, tokenizer, or reward parser).
+| metric                 | reinforce_with_baseline | no_baseline                  |
+|------------------------|-------------------------|------------------------------|
+| best val answer reward | **0.648** @ step 165    | 0.602 @ step 120             |
+| final val answer reward| **0.605** @ step 199    | 0.133 @ step 199             |
+| final val format reward| 0.805                   | **0.996** (saturates at 1.0) |
+| final val response len | 2393 chars              | **35 chars** (!)             |
+| max train grad_norm    | 1.49                    | **13.4** (post-clip, log-scale plot) |
+| final group_reward_std | 0.20                    | 0.05 (signal vanished)       |
 
-## The length-compression side effect
+Two things are happening:
 
-Both `1e-5` and `3e-5` shrink val response length by **~50%** over training (4144 → 2158 chars for 1e-5; for 3e-5 the length actually rebounds to 3308 by step 200 as it loses coherence). `3e-6` barely compresses (4064 → 3517).
+1. **For the first ~120 steps the runs look broadly similar**, with no_baseline trailing reinforce_with_baseline by ~5 pp on val accuracy and being noticeably slower to learn the response format (0.38 → 0.85 over 120 steps vs the baseline's 0.45 → 0.85 over 60 steps). So even pre-collapse, the baseline is providing modest variance reduction and faster format acquisition — exactly what the textbook says it should.
 
-Reward is purely terminal, so shorter-but-correct CoTs aren't *directly* incentivized — but the standard GRPO recipe uses `masked_mean` (`Σ over response tokens / num_response_tokens`) which weights every sequence equally regardless of length. That implicitly favors shorter rollouts: a correct 200-token CoT gets the same per-sequence loss weight as a correct 1500-token CoT, but contributes 7.5× more *per-token* gradient. Combined with `reinforce_with_baseline`'s mean-zero advantage shape, this gives the policy a steady push toward terser reasoning. Dr-GRPO's `Σ / L_max` length normalization removes this bias; we're following up with an ablation that swaps in `masked_normalize`.
+2. **Around step 130–140 no_baseline falls off a cliff.** Val accuracy goes 0.60 → 0.13 in 40 steps, response length goes 1500 → 35 chars, format reward sails up to a perfect 1.0, grad norm spikes 30× to 13.4, and the per-group reward std (the GRPO "signal-strength" metric) crashes from 0.20 to 0.05.
 
-The really interesting thing in the length plot is the `3e-5` run's late rebound from 1700 → 3700 chars between steps 100 and 200 — that mirrors the entropy bump and the reward decay, and is a third independent signal that the policy is breaking down.
+What the rollouts actually look like at step 199 makes the failure mode obvious — every one of the 128 rollouts at step 199 is nearly the same 33-character string:
 
-## Other small things worth knowing
+```
+<think>
+Okay, <answer>2</answer>
+```
 
-- `clip_fraction` is identically 0 across all runs, which is the expected sanity check for `reinforce_with_baseline` (no PPO ratio clipping). The `cliprange=0.2` setting only matters for `loss_type=grpo_clip`.
+The policy collapsed to a degenerate "lazy format" mode: emit the opening `<think>`, a placeholder reasoning token, then a constant numeric guess. There are only 43 unique responses across 128 rollouts at step 199 (vs 128/128 unique for reinforce_with_baseline). Format reward is 1.0 because the regex parses; answer reward is ~0.1 because "2" happens to be right ~10% of the time on Big-Math.
+
+### Why removing the baseline does this
+
+The collapse is mechanical, not a tuning accident:
+
+- With `reinforce_with_baseline`, advantages are mean-zero *within each group of 8 rollouts*. Some tokens get pushed up, others get pushed down, and groups where every rollout got the same reward contribute *zero* gradient. Once the policy saturates a behavior, the gradient on that behavior naturally turns off.
+- With `no_baseline`, advantages are just `reward/std` ≥ 0. Every "successful" trajectory unconditionally reinforces *every* token it emitted. Combined with the standard `masked_mean` per-token loss weighting (Σ over response tokens / num_response_tokens — already discussed in the length-compression section above), **shorter format-correct trajectories get a larger per-token gradient than longer ones**, and there's no negative signal to balance it out.
+- That gives a steady positive-feedback loop pushing toward "shortest possible format-valid output". The model finds the local minimum (`<think>\nOkay, <answer>X</answer>`) and hammers it. Once that mode locks in, every group has near-identical rewards, group reward std collapses to ~0.05, the advantage signal vanishes, and the policy can't dig itself back out.
+- The grad-norm spike to 13.4 at step ~145 is the visible convulsion as the policy commits to the lazy mode. After that, the policy is stuck and grad norm decays back down.
+
+### Other things
+
 - `group_reward_std_mean` (the average per-prompt reward std across the 8 rollouts) holds at 0.17–0.20 throughout for healthy runs. That's the signal-strength metric — when it collapses to ~0, advantages vanish and learning stalls. That's exactly what happens to `1e-4` after step 5.
-- The grader had a Unicode bug — answers like `1.656×10⁶` (Unicode superscript) were getting 0 reward against ground truth `1.656×10^{6}` because `_normalize` never folded `⁶` to `^6`. We patched it (recovers ~70 false-negatives across the existing rollout logs) but the patch only affects future training; the historical reward/advantage values used for the gradients above were the pre-patch ones. The numbers in this post would presumably nudge slightly upward with the fixed grader, but the *ordering* across LRs would not change.
 
-## Recommendations for follow-ups
+## Effect of length normalization: `masked_mean` vs `masked_normalize` (Dr-GRPO)
 
-1. **Run length budget**: 200 steps is enough to see overcook on `3e-5` and steady progress on `1e-5`. If we want a final number we should give `1e-5` another 100–200 steps and watch for the same overcook signature.
-2. **Grad clip is binding**: at `1e-5` and `3e-5` the grad norm is regularly at the 1.0 cap. Raising `grad_clip` to ~2.0 might give us actual headroom; right now nominal LR increases above `1e-5` are partly being eaten by the clip.
-3. **Early-warning monitor**: `train/token_entropy > 2× initial for 3 consecutive steps` would have killed the `1e-4` run by step 4 instead of letting it burn 200 steps of compute. Same idea for `train/token_entropy` *rising* late in training (the `3e-5` overcook would have triggered around step 120).
-4. **Eval cadence**: `eval_every=5` means the first sign of `1e-4`'s collapse in val didn't show up until step 5, when the policy was already broken. For new sweep configs, the first 10 steps should be eval'd every step.
-5. **Length normalization**: the systematic length compression at higher LRs is a real nuisance. The follow-up loss-type ablation (mean vs sum-with-Lmax; baseline vs no-baseline; std-norm on/off) is currently running on `cuda:4..7`.
+Same setup as the baseline ablation — keep `loss_type=reinforce_with_baseline`, `lr=1e-5`, same model, same data, same seed, 200 steps — and swap *only* the per-sequence aggregation. Vanilla GRPO uses `masked_mean` (Σ over response tokens / N_response_tokens); Dr-GRPO replaces it with `masked_normalize` and a fixed `normalize_constant=L_max=1536` (Σ over response tokens / L_max).
+
+![Length normalization compare](figs/length_norm_compare.png)
+
+Headline numbers:
+
+| metric                   | masked_mean (vanilla)     | masked_normalize (Dr-GRPO) |
+|--------------------------|---------------------------|----------------------------|
+| best val answer reward   | 0.648 @ step 165          | **0.656** @ step 185       |
+| final val answer reward  | 0.605                     | **0.641**                  |
+| max train grad_norm      | **1.49** (hits clip)      | 0.52 (never near clip)     |
+| final train grad_norm    | 0.65                      | **0.31**                   |
+| final train entropy      | 0.094                     | **0.117** (more retained)  |
+| final val response chars | 2393                      | 1921                       |
+
+### The big effect is on stability, not on score
+
+Val accuracy is essentially a tie — drnorm wins by ~3 pp at the end and is still climbing while masked_mean has plateaued, but at this scale the run-to-run noise on val/answer_reward is roughly that big. **The dramatic difference shows up in the gradient panel** (top-right):
+
+- **Grad norm is ~3× smaller and far smoother under drnorm.** masked_mean wanders 0.4–1.5 and bumps into the `grad_clip=1.0` ceiling repeatedly between steps 60 and 180 (peak 1.49). drnorm sits in a narrow 0.2–0.5 band the entire run and never gets within 2× of the clip. At `lr=1e-5` with masked_mean a meaningful fraction of updates are getting silently capped; under drnorm, the optimizer is operating in the regime it's actually configured for.
+
+- **Entropy decays less aggressively under drnorm** (0.20 → 0.12 by step 100 vs 0.20 → 0.08 for masked_mean) and stays *higher* throughout the second half. Consistent with the smaller effective LR: slower entropy decay means the policy preserves more sampling diversity, which probably also explains why drnorm is still trending up at step 200 while masked_mean has flattened.
+
+
+## Effect of group-std normalization: `use_std_normalization` on vs off
+
+The third loss-shape ablation. Same recipe as before — `loss_type=reinforce_with_baseline`, `lr=1e-5`, `length_normalization=masked_mean`, same model, data, seed — flip *only* `use_std_normalization` from `True` to `False`. With it on, the advantage is `(reward − group_mean) / (group_std + eps)` (the standard GRPO recipe). With it off, the advantage is just `(reward − group_mean)`.
+
+![Std-norm on vs off](figs/std_norm_compare.png)
+
+Headline numbers:
+
+| metric                   | std_norm ON (default)     | std_norm OFF              |
+|--------------------------|---------------------------|---------------------------|
+| best val answer reward   | **0.648** @ step 165      | 0.637 @ step 160          |
+| final val answer reward  | 0.605                     | **0.613**                 |
+| max train grad_norm      | **1.49** (hits clip)      | 0.76 (never near clip)    |
+| final train grad_norm    | 0.65                      | **0.22**                  |
+| final train entropy      | 0.094                     | **0.139** (more retained) |
+| final val response chars | 2393                      | 2773 (less compression)   |
+| advantage std (all rollouts) | 0.59                  | **0.26**                  |
+| advantage max(|·|)       | 2.47                      | **0.875**                 |
+
+### Same story as length normalization: it's a stability lever in score's clothing
+
+Val accuracy is again a tie within seed-noise (std_off final 0.613 vs std_on final 0.605; std_on's peak 0.648 vs std_off's 0.637 — ~1pp either way). Everything else is markedly different:
+
+- **Grad norm is ~2× smaller and ~2× smoother with std_norm OFF.** std_on wanders 0.4–1.5 and bumps the `grad_clip=1.0` ceiling repeatedly between steps 60–180 (peak 1.49). std_off sits in a tight 0.15–0.5 band the entire run — it never gets within 2× of the clip. The factor of two falls right out of the advantage-distribution numbers below.
+- **Train loss has visibly lower variance** with std_off and centers slightly closer to zero. Both are mean-zero by construction (the baseline is doing that work, not the std-norm), but std_off's per-microbatch loss has clearly smaller excursions.
+- **Entropy is dramatically better preserved with std_off** (0.20 → 0.14 vs 0.20 → 0.094 by step 100) and even *rises slightly* in the second half toward 0.16 — without that signal also coinciding with collapse signs (group_reward_std stays healthy, val keeps rising), the entropy bump here is benign and just reflects the smaller per-update step. With std_on the entropy collapse is much steeper, consistent with the larger effective updates.
 
 ## Repro
 
