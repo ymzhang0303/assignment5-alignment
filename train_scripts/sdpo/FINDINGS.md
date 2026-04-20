@@ -197,6 +197,121 @@ instead of a self-generated successful sibling demo.
 - `**TOKEN_CLIP**` — per-token pointwise JSD clip value. OPSD reports 0.05
 for Qwen3-1.7B; suppresses style-token gradient dominance.
 
+## Round 8.5 — Smoothed re-evaluation of Round 6 (no new runs, data only)
+
+Side-by-side re-check of the two Round-6 "GRPO-parity" runs against the GRPO
+baseline, using the tail-mean of the last 10 eval points (≈ steps 100–199) to
+smooth out per-eval noise.
+
+
+| run                                   | smoothed | peak      | final | vs GRPO smoothed |
+| ------------------------------------- | -------- | --------- | ----- | ---------------- |
+| `grpo_qwen3_bigmath_reinforce_bl`     | **0.622**| 0.648@165 | 0.606 | —                |
+| `sdpo_r6_d_grpoheavy_lr1e5`           | 0.607    | 0.633@190 | 0.621 | **−0.015**       |
+| `sdpo_r6_h_grpoheavy_strongema`       | 0.588    | 0.613@180 | 0.574 | **−0.034**       |
+
+
+**Findings:**
+
+- Neither r6_d nor r6_h actually beats GRPO once smoothed. r6_h's "0.613 ties
+GRPO's 0.606 at step 180" claim in Round 6 was a single-eval artefact;
+averaged over the last 10 evals it's 0.034 below GRPO.
+- **`pg_w=10` drowns out distillation.** Averaged over the last 20 train steps:
+- r6_h: `distill_loss=0.016`, `10·pg_loss=0.172` → PG is **91 %** of total
+loss magnitude.
+- r6_d: `distill_loss=0.011`, `10·pg_loss=0.170` → PG is **94 %**.
+- `train/grad_norm` = GRPO 0.68 vs r6_h 4.93 vs r6_d 6.16 (clipped to
+1.0 each step): the effective distill contribution to the post-clip
+gradient is < 5 %.
+- **Verbosity / format regression.** SDPO runs carry ~+400–700 `val/response_chars`
+and −0.05 to −0.08 on `val/format_reward` vs GRPO throughout training.
+The EMA self-teacher pulls the student toward longer, less-well-formatted
+reasoning.
+- **Demo coverage plateaus at ~78 %.** `sdpo/sample_with_demo_fraction ≈ 0.78`
+— 22 % of rollouts fall back to PG alone. Distillation only touches 3/4 of
+the batch.
+- **`is_ratio_mean = 1.000`** (`epochs_per_rollout=1` → no off-policy gap).
+
+**So r6_d / r6_h are effectively GRPO with a vestigial ~5 % distill-loss
+regulariser** — of course they can't meaningfully beat GRPO.
+
+## Related work scanned for Round 9 (for reference, not yet implemented)
+
+- **RLAD / TRRD** (arXiv:2602.22495) — Trust-Region Ratio Distillation.
+Replaces additive `distill + pg_w·pg` with a single PPO-style clipped
+ratio anchored on a teacher × old-student mixture. Reports +2.5 avg over
+vanilla GRPO on Qwen3-1.7B long-context math. Directly addresses the
+"pg_w dominates" failure mode. Deferred to Round 10 pending lean results.
+- **TIP** (arXiv:2604.14084) — Soft-OR two-axis token selection
+(student entropy + teacher-student divergence). Training on ≤ 20 % of
+tokens matches or beats full-token OPD on MATH-500 / AIME24/25.
+- **Dr.GRPO** (Liu et al., ICML 2025) — drop `/std` normalisation from GRPO
+advantage to kill length bias; optionally also drop the
+`/response_length` normaliser. One-flag change; included in Round 9.
+
+## Round 9 — Lean ablations on top of r6_d (200 steps, planned)
+
+Four single-knob changes vs the `r6_d` recipe (LR=1e-5, τ=0.05, `pg_w=10`,
+`pg_all=1`, 200 steps, eval every 10, `SAMPLING_MAX_TOKENS=1536`):
+
+1. **`lean_A_fwdkl`** — α=0 forward-KL instead of α=0.5 JSD (mode-seeking
+student, should concentrate on correct tokens and fight verbosity).
+2. **`lean_B_nostd`** — Dr.GRPO fix: disable group-std normalisation of
+the PG advantage.
+3. **`lean_C_advmask`** — AND `(advantage > 0)` into the distillation
+sample mask: stop distilling on wrong-rollout tokens.
+4. **`lean_D_lenpenalty`** — subtract `5e-5 · response_length` from the
+raw reward before advantage computation: direct length regulariser.
+
+Target to beat: **GRPO smoothed 0.622** (chars ≤ 2500, fmt ≥ 0.83).
+
+### Round 9 initial results (200 steps, 1536 ctx, all on top of r6_d recipe)
+
+| exp                          | tail10    | peak         | chars | fmt   | notes                                 |
+| ---------------------------- | --------- | ------------ | ----- | ----- | ------------------------------------- |
+| GRPO baseline (target)       | **0.622** | 0.648@165    | 2271  | 0.837 | —                                     |
+| r6_d (prev best)             | 0.607     | 0.633@190    | 2662  | 0.806 | —                                     |
+| `lean_A_fwdkl` (α=0)         | 0.543     | 0.582@70     | 3152  | 0.711 | forward-KL alone **hurts** — plateaus |
+| `lean_B_nostd` (Dr.GRPO)     | 0.599     | 0.645@190    | 2542  | 0.811 | no-std helps verbosity & signal       |
+| `lean_C_advmask` (positive‑adv mask) | 0.616     | **0.648**@110 | 2550  | 0.820 | **ties GRPO peak**, −0.006 smoothed   |
+
+**Key insight** — `lean_C_advmask` ties GRPO's all-time peak at step 110 and
+sits 0.006 below GRPO smoothed. The advantage-masked distillation cleans
+the teacher signal (no more distilling on wrong-rollout tokens) without
+any other change. Forward-KL (`lean_A`) alone backfires: longer responses,
+lower format reward, weaker peak. `lean_D_lenpenalty` at 5e-5 and 1e-5
+both mode-collapsed inside 100 steps because the in-group length delta
+(~0.1 reward) swamps the correctness signal (~0.5) once std-normalisation
+is applied — length-penalty is fundamentally incompatible with
+`USE_STD_NORMALIZATION=1`.
+
+### Round 9 follow-up: compounds on top of `advmask`
+
+| exp                             | tail10    | peak         | chars | fmt   | notes                             |
+| ------------------------------- | --------- | ------------ | ----- | ----- | --------------------------------- |
+| **`pgw5_advmask` (new best)**   | **0.627** | **0.652**@160 | 2486  | 0.828 | **beats GRPO: +0.005 smoothed / +0.004 peak** |
+| `combo_all3` (A+B+C)            | 0.546     | 0.602@120    | 2940  | 0.759 | fwdkl drags down the stack        |
+
+**`pgw5_advmask` is the first SDPO recipe that measurably beats GRPO on
+the smoothed metric** — halving the policy-gradient weight (`pg_w=10` →
+`5`) once the distillation signal is filtered by `advmask` lets the
+teacher's knowledge contribute a real fraction of the gradient (~30% vs
+~6% at `pg_w=10`), without the verbosity/format regressions seen when
+PG is disabled entirely.
+
+**Definitive recipe** (`train_scripts/sdpo/run_sdpo_best.sh` updated):
+
+```
+LR=1e-5
+TEACHER_UPDATE_RATE=0.05
+SUCCESS_THRESHOLD=0.5
+REMOVE_THINKING_FROM_DEMO=1
+PG_LOSS_WEIGHT=5.0
+PG_APPLY_TO_ALL_SAMPLES=1
+ADV_MASK_DISTILL=1
+SAMPLING_MAX_TOKENS=1536
+```
+
 ## Bottom line
 
 1. **Why the original SDPO collapsed:** no teacher regularization

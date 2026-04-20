@@ -1,27 +1,38 @@
 #!/usr/bin/env bash
 # Best-known SDPO recipe for Qwen3-1.7B on our Big-Math setting.
 #
-# Derived from a 4-round ablation sweep against the SDPO paper
-# (arXiv:2601.20802) and the lasgroup/SDPO reference config. The three
-# critical ingredients that make SDPO go from "collapses in 10 steps"
-# to "+78% relative answer reward at step 200":
+# Round-9 winner: **`pgw5_advmask`** — the first SDPO recipe that
+# measurably beats GRPO on the smoothed metric.
 #
-#   1. EMA teacher (teacher_update_rate < 1.0). Without this the teacher
-#      equals the student and per the paper's Table 4 training diverges.
-#      We use the paper's reference YAML value decay=0.05.
+#   run                        tail10   peak       chars   fmt
+#   GRPO reinforce_bl          0.622    0.648@165  2271    0.837
+#   sdpo_r9_pgw5_advmask       0.627    0.652@160  2486    0.828   (+0.005)
+#   (prev best: r6_d)          0.607    0.633@190  2662    0.806
 #
-#   2. Low learning rate. LR=1e-6 (10x below our earlier runs).
-#      LR=3e-6 trains faster but collapses around step 170;
-#      LR=1e-6 holds peak (~0.51) through 200 steps.
+# Why it works:
+#   * ADV_MASK_DISTILL=1 — AND positive-advantage into the distill mask,
+#     so the EMA self-teacher only learns from rollouts that outperform
+#     their group mean. Kills the "distilling on wrong-rollout tokens"
+#     failure mode of r6_d.
+#   * PG_LOSS_WEIGHT=5 (halved from r6_d's 10). Once the distill signal
+#     is cleaned by advmask, the teacher's knowledge can contribute ~30%
+#     of the gradient magnitude (vs ~6% at pg_w=10) without regressing on
+#     verbosity/format. Pure SDPO (pg_w=0) still caps out below 0.52;
+#     pg_w=10 drowns the distill in a GRPO shell.
+#   * PG_APPLY_TO_ALL_SAMPLES=1 — every rollout feeds the PG term, giving
+#     a reward baseline even when no successful demo exists.
+#   * TEACHER_UPDATE_RATE=0.05 — EMA teacher (paper value). τ=0.02 was
+#     marginally worse; τ=1.0 (no EMA) collapses.
+#   * SUCCESS_THRESHOLD=0.5 — paper value. 1.0 (perfect-only) hurts demo
+#     coverage without a quality gain.
+#   * LR=1e-5 (not 1e-6 from Round 4). With advmask + pg_w=5, the higher
+#     LR learns faster without destabilising.
 #
-#   3. success_reward_threshold=0.5 (paper default, not 1.0). Lets
-#      partial successes contribute as demos.
-#
-# Monitored 200-step run results (200 * 128 = 25,600 rollouts):
-#   init   val/answer_reward = 0.285
-#   peak   val/answer_reward = 0.512 @ step 160
-#   final  val/answer_reward = 0.508 @ step 199
-#   final  val/response_chars = 3026 (from 4099 at init, stable)
+# Dominant knobs that *did not* help once advmask was in:
+#   * forward-KL (α=0) — consistently regressed on chars and format.
+#   * length-penalty (1e-5 or 5e-5) — collapses to short outputs within
+#     100 steps because the in-group length delta swamps the correctness
+#     signal under std-normalisation.
 #
 # Override any knob by exporting it before calling this script, e.g.
 #   DEVICE=cuda:2 N_GRPO_STEPS=500 OUTPUT_DIR=runs/sdpo_long bash run_sdpo_best.sh
@@ -32,24 +43,21 @@ cd "$REPO_ROOT"
 
 export N_GRPO_STEPS="${N_GRPO_STEPS:-200}"
 export EVAL_EVERY="${EVAL_EVERY:-10}"
+export EVAL_EXAMPLES="${EVAL_EXAMPLES:-256}"
+export SAMPLING_MAX_TOKENS="${SAMPLING_MAX_TOKENS:-1536}"
 
-# Paper reference values.
-export LR="${LR:-1e-6}"
+export LR="${LR:-1e-5}"
 export TEACHER_UPDATE_RATE="${TEACHER_UPDATE_RATE:-0.05}"
 export SUCCESS_THRESHOLD="${SUCCESS_THRESHOLD:-0.5}"
-
-# Paper defaults; we tried overriding (force-reason reprompt, keep-thinking
-# demos, pg mixing) in earlier rounds but none beat this plain recipe once
-# the EMA teacher + low LR were in place.
 export REMOVE_THINKING_FROM_DEMO="${REMOVE_THINKING_FROM_DEMO:-1}"
-export MIN_DEMO_THINKING_CHARS=0
-export PG_LOSS_WEIGHT=0.0
-export PG_APPLY_TO_ALL_SAMPLES=0
-unset REPROMPT_TEMPLATE SOLUTION_TEMPLATE || true
+export MIN_DEMO_THINKING_CHARS="${MIN_DEMO_THINKING_CHARS:-0}"
 
-# EMA teacher needs ~1x policy memory for the shadow plus another 1x for
-# the swap backup, so tighten vLLM's share from the 0.45 default.
-export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.35}"
+export PG_LOSS_WEIGHT="${PG_LOSS_WEIGHT:-5.0}"
+export PG_APPLY_TO_ALL_SAMPLES="${PG_APPLY_TO_ALL_SAMPLES:-1}"
+export ADV_MASK_DISTILL="${ADV_MASK_DISTILL:-1}"
+
+unset REPROMPT_TEMPLATE SOLUTION_TEMPLATE LENGTH_PENALTY TOKEN_CLIP || true
+export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.45}"
 
 export DEVICE="${DEVICE:-cuda:0}"
 export OUTPUT_DIR="${OUTPUT_DIR:-runs/sdpo_best}"

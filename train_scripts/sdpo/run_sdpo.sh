@@ -109,6 +109,20 @@ if [[ -n "$TOKEN_CLIP" && "$TOKEN_CLIP" != "none" && "$TOKEN_CLIP" != "0" ]]; th
     TOKEN_CLIP_FLAGS=(--token-clip "$TOKEN_CLIP")
 fi
 
+# Round-9 lean-C: restrict the self-distillation mask to rollouts with
+# positive group advantage, so we don't distill on wrong-rollout tokens.
+ADV_MASK_DISTILL="${ADV_MASK_DISTILL:-0}"
+case "$ADV_MASK_DISTILL" in
+    1|true|True|TRUE|yes|on)  ADV_MASK_FLAG="--adv-mask-distill" ;;
+    0|false|False|FALSE|no|off) ADV_MASK_FLAG="--no-adv-mask-distill" ;;
+    *) echo "ADV_MASK_DISTILL must be 0/1" >&2; exit 1 ;;
+esac
+
+# Round-9 lean-D: Dr.GRPO-style per-token length penalty. Subtract
+# LENGTH_PENALTY * response_length_tokens from the raw reward before
+# advantage normalisation. 0 disables (default).
+LENGTH_PENALTY="${LENGTH_PENALTY:-0.0}"
+
 # Optional reprompt-template overrides (set REPROMPT_TEMPLATE / SOLUTION_TEMPLATE
 # to non-empty strings to override the SDPO defaults). The defaults live in
 # cs336_alignment/sdpo.py.
@@ -158,6 +172,8 @@ uv run python -m cs336_alignment.sdpo_train \
     "${TOKEN_CLIP_FLAGS[@]}" \
     "${EXTRA_REPROMPT_FLAGS[@]}" \
     "$STD_NORM_FLAG" \
+    "$ADV_MASK_FLAG" \
+    --length-penalty "$LENGTH_PENALTY" \
     --eval-every "$EVAL_EVERY" \
     --eval-examples "$EVAL_EXAMPLES" \
     --log-all-rollouts \

@@ -421,6 +421,26 @@ def main(
             "are often single digits ('2', '5') so keep this at 1."
         ),
     ),
+    adv_mask_distill: bool = typer.Option(
+        False,
+        help=(
+            "If True, AND the per-sample self-distillation mask with "
+            "(advantage > 0). Only rollouts that outperform their group "
+            "mean contribute to the distillation loss, which prevents the "
+            "EMA self-teacher from being pulled toward tokens from "
+            "wrong-rollout trajectories. Round-9 lean-C ablation."
+        ),
+    ),
+    length_penalty: float = typer.Option(
+        0.0,
+        help=(
+            "Dr.GRPO-inspired length regulariser. Subtract "
+            "(length_penalty * response_length_in_tokens) from the raw "
+            "reward before group-normalised advantage computation. 0 "
+            "disables (default). A typical setting is 5e-5, which removes "
+            "~0.02 reward from a 400-token rollout."
+        ),
+    ),
     seed: int = 0,
     eval_every: int = 5,
     eval_examples: int = 1024,
@@ -668,6 +688,34 @@ def main(
             normalize_by_std=use_std_normalization,
         )
 
+        # ---- 3a. optional Dr.GRPO-style length penalty: subtract
+        # length_penalty * response_length_in_tokens from each raw reward,
+        # then re-derive advantages from the adjusted rewards. Applied
+        # before group normalisation so the penalty participates in the
+        # group baseline.
+        if length_penalty > 0.0:
+            response_tok_lens = torch.tensor(
+                [
+                    len(tokenizer.encode(r, add_special_tokens=False))
+                    for r in rollout_responses
+                ],
+                dtype=raw_rewards.dtype,
+            )
+            raw_rewards = raw_rewards - length_penalty * response_tok_lens
+            grouped = raw_rewards.view(-1, group_size)
+            group_means = grouped.mean(dim=-1, keepdim=True)
+            adv_g = grouped - group_means
+            if use_std_normalization:
+                group_stds = grouped.std(dim=-1, keepdim=True, unbiased=False)
+                adv_g = adv_g / (group_stds + advantage_eps)
+            advantages = adv_g.reshape(-1)
+            reward_meta["train/length_penalty_reward_delta"] = float(
+                (length_penalty * response_tok_lens).mean().item()
+            )
+            reward_meta["train/response_tok_len_mean"] = float(
+                response_tok_lens.mean().item()
+            )
+
         # ---- 3b. SDPO: pick demos and build reprompted prompts ---- #
         # Reshape rewards/responses to (n_prompts, group_size) for demo picking.
         n_prompts = len(student_prompt_strs)
@@ -725,6 +773,21 @@ def main(
             [1.0 if h else 0.0 for h in has_signal], dtype=torch.float32
         )
 
+        # ---- 3c. Round-9 lean-C: AND positive-advantage into the distill
+        # mask so we don't distill on wrong-rollout tokens. Does nothing when
+        # no sample has a teacher signal (mask is already zero).
+        if adv_mask_distill:
+            pos_adv = (advantages > 0).to(self_distillation_mask.dtype)
+            mask_pre = self_distillation_mask.clone()
+            self_distillation_mask = self_distillation_mask * pos_adv
+            denom = float(mask_pre.sum().clamp_min(1.0).item())
+            reward_meta["sdpo/adv_mask_surviving_frac"] = float(
+                self_distillation_mask.sum().item() / denom
+            )
+            reward_meta["sdpo/adv_mask_kept_samples"] = float(
+                self_distillation_mask.sum().item()
+            )
+
         # ---- 4. tokenize student-side and teacher-side ---- #
         student_tok = tokenize_prompt_response_pair(
             repeated_student_prompts, rollout_responses, tokenizer
@@ -757,6 +820,7 @@ def main(
         token_clip_frac_running = 0.0
         token_pre_clip_running = 0.0
         token_post_clip_running = 0.0
+        entropy_running = 0.0
         n_micro = 0
 
         for epoch in range(epochs_per_rollout_batch):
@@ -812,11 +876,13 @@ def main(
                         topk=sd_config.distillation_topk
                         if sd_config.full_logit_distillation
                         else None,
+                        return_token_entropy=True,
                     )
                     s_log_probs_full = s_out["log_probs"]
                     s_topk_log_probs_full = s_out.get("topk_log_probs")
                     s_topk_indices_full = s_out.get("topk_indices")
                     s_all_log_probs_full = s_out.get("all_log_probs")
+                    s_token_entropy_full = s_out.get("token_entropy")
 
                     # ---- teacher forward (no grad) ---- #
                     # Project student's top-k indices into the teacher's
@@ -965,6 +1031,14 @@ def main(
                     distill_loss_running += float(meta["sdpo/distill_loss"].item())
                     pg_loss_running += float(meta["sdpo/pg_loss"].item())
                     sd_token_running += float(meta["sdpo/sd_token_count"].item())
+                    if s_token_entropy_full is not None:
+                        with torch.no_grad():
+                            s_token_entropy = _gather_response_only(
+                                s_token_entropy_full, s_response_mask, response_len
+                            )
+                            entropy_running += float(
+                                masked_mean(s_token_entropy, aligned_response_mask).item()
+                            )
                     if "sdpo/is_ratio_mean" in meta:
                         is_ratio_running += float(meta["sdpo/is_ratio_mean"].item())
                     if "sdpo/token_clip_fraction" in meta:
@@ -995,10 +1069,12 @@ def main(
         avg_pg = pg_loss_running / max(n_micro, 1)
         avg_sd_tokens = sd_token_running / max(n_micro, 1)
         avg_is_ratio = is_ratio_running / max(n_micro, 1)
+        avg_entropy = entropy_running / max(n_micro, 1)
 
         metrics: dict[str, Any] = {
             "train/loss": avg_loss,
             "train/grad_norm": grad_norm,
+            "train/token_entropy": avg_entropy,
             "train/reward_mean": reward_meta["reward_mean"],
             "train/reward_std": reward_meta["reward_std"],
             "train/format_reward_mean": reward_meta["format_reward_mean"],
