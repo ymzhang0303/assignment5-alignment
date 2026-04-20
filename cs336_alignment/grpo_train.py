@@ -337,6 +337,24 @@ def main(
         help="One of {no_baseline, reinforce_with_baseline, grpo_clip}.",
     ),
     use_std_normalization: bool = True,
+    length_normalization: str = typer.Option(
+        "masked_mean",
+        help=(
+            "Sequence-dim reducer for the per-token policy-gradient loss. "
+            "'masked_mean' (default) averages over response tokens "
+            "(standard GRPO; biased toward shorter sequences). "
+            "'masked_normalize' uses Dr-GRPO style sum / normalize_constant "
+            "to remove the length bias."
+        ),
+    ),
+    normalize_constant: Optional[float] = typer.Option(
+        None,
+        help=(
+            "Denominator for length_normalization='masked_normalize'. "
+            "Defaults to sampling_max_tokens if unset, so per-token weights "
+            "match those of a fully-extended rollout."
+        ),
+    ),
     cliprange: float = 0.2,
     grad_clip: float = 1.0,
     seed: int = 0,
@@ -395,6 +413,17 @@ def main(
     valid_loss_types = {"no_baseline", "reinforce_with_baseline", "grpo_clip"}
     if loss_type not in valid_loss_types:
         raise ValueError(f"loss_type must be one of {valid_loss_types}")
+    valid_length_norms = {"masked_mean", "masked_normalize"}
+    if length_normalization not in valid_length_norms:
+        raise ValueError(
+            f"length_normalization must be one of {valid_length_norms}"
+        )
+    if length_normalization == "masked_normalize" and normalize_constant is None:
+        normalize_constant = float(sampling_max_tokens)
+        print(
+            f"length_normalization='masked_normalize' but no --normalize-constant; "
+            f"defaulting to sampling_max_tokens={sampling_max_tokens}."
+        )
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     config = {k: v for k, v in locals().items() if not k.startswith("_")}
@@ -635,6 +664,8 @@ def main(
                         advantages=adv_kw,
                         old_log_probs=old_kw,
                         cliprange=cliprange if loss_type == "grpo_clip" else None,
+                        length_normalization=length_normalization,
+                        normalize_constant=normalize_constant,
                     )
 
                     loss_running += float(loss.detach().item()) * gradient_accumulation_steps

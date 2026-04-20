@@ -285,12 +285,27 @@ def grpo_microbatch_train_step(
     advantages: torch.Tensor | None = None,
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
+    length_normalization: Literal["masked_mean", "masked_normalize"] = "masked_mean",
+    normalize_constant: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """One microbatch forward+backward pass for GRPO.
 
-    Computes the per-token policy-gradient loss, averages with ``masked_mean``
-    over the sequence dimension, then averages over the batch and divides by
+    Computes the per-token policy-gradient loss, reduces it along the sequence
+    dimension, averages over the batch, and divides by
     ``gradient_accumulation_steps`` before calling ``backward``.
+
+    The sequence-dim reducer is selectable:
+
+    * ``length_normalization="masked_mean"`` (default): per-example loss is the
+      *average* over response tokens (``Σ / num_response_tokens``). This is the
+      standard GRPO recipe and weights every sequence equally regardless of
+      length, which biases the policy toward shorter rollouts (see Dr-GRPO).
+    * ``length_normalization="masked_normalize"``: per-example loss is the
+      *sum* over response tokens divided by ``normalize_constant`` (Dr-GRPO
+      style ``Σ / L_max``). This removes the per-sequence length bias --
+      longer correct rollouts contribute proportionally more gradient. Pick
+      ``normalize_constant`` to be the rollout cap (e.g., ``sampling_max_tokens``)
+      so the per-token weight matches that of a fully-extended rollout.
     """
     per_token_loss, loss_metadata = compute_policy_gradient_loss(
         policy_log_probs=policy_log_probs,
@@ -301,7 +316,26 @@ def grpo_microbatch_train_step(
         cliprange=cliprange,
     )
 
-    per_example_loss = masked_mean(per_token_loss, response_mask, dim=-1)
+    if length_normalization == "masked_mean":
+        per_example_loss = masked_mean(per_token_loss, response_mask, dim=-1)
+    elif length_normalization == "masked_normalize":
+        if normalize_constant is None or normalize_constant <= 0:
+            raise ValueError(
+                "length_normalization='masked_normalize' requires a positive "
+                "normalize_constant (e.g., sampling_max_tokens)."
+            )
+        per_example_loss = masked_normalize(
+            per_token_loss,
+            response_mask,
+            dim=-1,
+            normalize_constant=float(normalize_constant),
+        )
+    else:
+        raise ValueError(
+            f"Unknown length_normalization {length_normalization!r}; expected "
+            f"'masked_mean' or 'masked_normalize'."
+        )
+
     loss = per_example_loss.mean() / gradient_accumulation_steps
     loss.backward()
 
