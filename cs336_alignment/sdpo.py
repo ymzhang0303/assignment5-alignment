@@ -151,6 +151,19 @@ DEFAULT_REPROMPT_TEMPLATE = (
     "{prompt}{solution}{feedback}\n\nCorrectly solve the original question."
 )
 DEFAULT_SOLUTION_TEMPLATE = "\n\nCorrect solution:\n\n{successful_previous_attempt}"
+
+# OPSD (arXiv:2601.18734) "privileged ground-truth" teacher prompt. The
+# teacher sees the reference answer and is asked to rationalise it, yielding
+# a strong next-token distribution to distill from, for 100% of rollouts.
+OPSD_REPROMPT_TEMPLATE = (
+    "{prompt}{solution}{feedback}\n\n"
+    "Re-derive the answer above with a complete step-by-step argument. "
+    "Show all work, then state the final answer in the required format."
+)
+OPSD_SOLUTION_TEMPLATE = (
+    "\n\nPrivileged information: the correct final answer is "
+    "{successful_previous_attempt}"
+)
 DEFAULT_FEEDBACK_TEMPLATE = (
     "\n\nThe following is feedback from your unsuccessful earlier attempt:"
     "\n\n{feedback_raw}"
@@ -365,6 +378,13 @@ class SelfDistillationConfig:
     distillation_add_tail: bool = True
     alpha: float = 0.5
     is_clip: Optional[float] = 2.0
+    # Per-token pointwise divergence clipping (OPSD, arXiv:2601.18734).
+    # Clips each per-token KL/JSD value at this max before averaging. The
+    # OPSD README notes style tokens ("wait", "think", ...) can exhibit
+    # 6-15x higher divergence than math tokens and dominate the gradient;
+    # clipping stabilises training. Their reference value is 0.05 (1.7B/4B)
+    # or 0.06 (8B). None = no clipping (our previous behaviour).
+    token_clip: Optional[float] = None
 
 
 def compute_self_distillation_loss(
@@ -462,6 +482,27 @@ def compute_self_distillation_loss(
         # function (∂/∂θ E_{p_s}[log p_s] = E_{p_s}[(stopgrad·∇ log p_s)]).
         per_token_loss = log_ratio.detach() * student_log_probs
 
+    # OPSD-style per-token pointwise divergence clipping. Capping each
+    # token's contribution prevents high-divergence stylistic tokens (e.g.
+    # '<think>', 'wait', newlines) from dominating the gradient over the
+    # math-content tokens we actually want to distill. Applied *before*
+    # importance-sampling reweighting so that a large divergence paired
+    # with a large IS ratio can't together blow up the loss.
+    if config.token_clip is not None:
+        raw_token_loss = per_token_loss
+        per_token_loss = per_token_loss.clamp(max=config.token_clip)
+        with torch.no_grad():
+            live_mask = sample_mask.to(raw_token_loss.dtype)
+            denom = live_mask.sum().clamp_min(1.0)
+            clipped = (raw_token_loss > config.token_clip).to(raw_token_loss.dtype)
+            metrics["token_clip_fraction"] = (clipped * live_mask).sum() / denom
+            metrics["token_loss_pre_clip_mean"] = (
+                raw_token_loss.detach() * live_mask
+            ).sum() / denom
+            metrics["token_loss_post_clip_mean"] = (
+                per_token_loss.detach() * live_mask
+            ).sum() / denom
+
     if config.is_clip is not None:
         if old_log_probs is None:
             raise ValueError("old_log_probs required when is_clip is set")
@@ -557,6 +598,9 @@ def sdpo_microbatch_train_step(
     }
     if "is_ratio_mean" in distill_meta:
         metadata["sdpo/is_ratio_mean"] = distill_meta["is_ratio_mean"]
+    for k in ("token_clip_fraction", "token_loss_pre_clip_mean", "token_loss_post_clip_mean"):
+        if k in distill_meta:
+            metadata[f"sdpo/{k}"] = distill_meta[k]
     return loss, metadata
 
 

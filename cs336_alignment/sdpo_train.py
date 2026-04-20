@@ -75,6 +75,8 @@ from cs336_alignment.sdpo import (
     DEFAULT_FEEDBACK_TEMPLATE,
     DEFAULT_REPROMPT_TEMPLATE,
     DEFAULT_SOLUTION_TEMPLATE,
+    OPSD_REPROMPT_TEMPLATE,
+    OPSD_SOLUTION_TEMPLATE,
     EmaTeacher,
     SelfDistillationConfig,
     build_reprompts,
@@ -313,6 +315,16 @@ def main(
         0.5,
         help="0=forward KL(s||t), 1=reverse KL(t||s), 0.5=JSD (default).",
     ),
+    token_clip: Optional[float] = typer.Option(
+        None,
+        help=(
+            "OPSD (arXiv:2601.18734) per-token pointwise divergence clip: "
+            "cap each token's KL/JSD contribution at this max before "
+            "averaging. Prevents stylistic tokens ('<think>', 'wait', "
+            "newlines) from dominating the gradient. OPSD's reference "
+            "value for Qwen3-1.7B is 0.05. None (default) = no clipping."
+        ),
+    ),
     is_clip: Optional[float] = typer.Option(
         2.0,
         help="Importance-sampling clip on the distillation loss; null disables.",
@@ -384,6 +396,29 @@ def main(
             "EMA decay for the teacher shadow weights. 1.0 (default) = "
             "teacher always equals current policy and we don't materialise "
             "a separate copy. <1.0 keeps a bf16 EMA shadow on GPU."
+        ),
+    ),
+    gt_teacher: bool = typer.Option(
+        False,
+        help=(
+            "OPSD-style teacher (arXiv:2601.18734): instead of conditioning "
+            "the teacher on a self-generated successful demo, condition it "
+            "on the ground-truth answer from the dataset. Every sample "
+            "(whose ground truth is non-empty and not 'Omitted') then gets "
+            "a strong, reliable teacher signal, vs ~50-70% coverage from "
+            "self-generated demos. Implemented by injecting the ground "
+            "truth as the 'demo' into build_reprompts; we also swap in an "
+            "OPSD-style reprompt template that phrases it as privileged "
+            "information the teacher should rationalise."
+        ),
+    ),
+    gt_teacher_min_chars: int = typer.Option(
+        1,
+        help=(
+            "Minimum non-whitespace chars in a ground-truth string for it "
+            "to be considered a usable teacher signal under --gt-teacher. "
+            "Filters out 'Omitted', empty strings, etc. BigMath answers "
+            "are often single digits ('2', '5') so keep this at 1."
         ),
     ),
     seed: int = 0,
@@ -558,6 +593,7 @@ def main(
         distillation_add_tail=distillation_add_tail,
         alpha=sdpo_alpha,
         is_clip=is_clip,
+        token_clip=token_clip,
     )
 
     # ---------- main loop ---------- #
@@ -643,22 +679,39 @@ def main(
         ]
 
         demos: list[Optional[str]] = []
-        for p in range(n_prompts):
-            for g in range(group_size):
-                demos.append(
-                    pick_successful_demo(
-                        rewards_2d[p],
-                        responses_2d[p],
-                        self_idx=g,
-                        success_reward_threshold=success_reward_threshold,
-                        dont_reprompt_on_self_success=dont_reprompt_on_self_success,
-                        remove_thinking_from_demonstration=remove_thinking_from_demonstration,
-                        min_demo_thinking_chars=min_demo_thinking_chars,
-                    )
+        if gt_teacher:
+            # OPSD mode: teacher conditions on dataset ground-truth answer.
+            # Every sample in a prompt's group shares the same gt demo.
+            for p in range(n_prompts):
+                gt = (ground_truths[p] or "").strip()
+                gt_usable = (
+                    len(gt.replace(" ", "")) >= gt_teacher_min_chars
+                    and "Omitted" not in gt
                 )
+                demo = gt if gt_usable else None
+                for _ in range(group_size):
+                    demos.append(demo)
+        else:
+            for p in range(n_prompts):
+                for g in range(group_size):
+                    demos.append(
+                        pick_successful_demo(
+                            rewards_2d[p],
+                            responses_2d[p],
+                            self_idx=g,
+                            success_reward_threshold=success_reward_threshold,
+                            dont_reprompt_on_self_success=dont_reprompt_on_self_success,
+                            remove_thinking_from_demonstration=remove_thinking_from_demonstration,
+                            min_demo_thinking_chars=min_demo_thinking_chars,
+                        )
+                    )
 
-        active_reprompt_tmpl = reprompt_template or DEFAULT_REPROMPT_TEMPLATE
-        active_solution_tmpl = solution_template or DEFAULT_SOLUTION_TEMPLATE
+        if gt_teacher:
+            active_reprompt_tmpl = reprompt_template or OPSD_REPROMPT_TEMPLATE
+            active_solution_tmpl = solution_template or OPSD_SOLUTION_TEMPLATE
+        else:
+            active_reprompt_tmpl = reprompt_template or DEFAULT_REPROMPT_TEMPLATE
+            active_solution_tmpl = solution_template or DEFAULT_SOLUTION_TEMPLATE
         reprompted_user_strs, has_signal = build_reprompts(
             repeated_user_questions,
             demos,
@@ -701,6 +754,9 @@ def main(
         pg_loss_running = 0.0
         sd_token_running = 0.0
         is_ratio_running = 0.0
+        token_clip_frac_running = 0.0
+        token_pre_clip_running = 0.0
+        token_post_clip_running = 0.0
         n_micro = 0
 
         for epoch in range(epochs_per_rollout_batch):
@@ -911,6 +967,16 @@ def main(
                     sd_token_running += float(meta["sdpo/sd_token_count"].item())
                     if "sdpo/is_ratio_mean" in meta:
                         is_ratio_running += float(meta["sdpo/is_ratio_mean"].item())
+                    if "sdpo/token_clip_fraction" in meta:
+                        token_clip_frac_running += float(
+                            meta["sdpo/token_clip_fraction"].item()
+                        )
+                        token_pre_clip_running += float(
+                            meta["sdpo/token_loss_pre_clip_mean"].item()
+                        )
+                        token_post_clip_running += float(
+                            meta["sdpo/token_loss_post_clip_mean"].item()
+                        )
                     n_micro += 1
 
                 grad_norm = float(
@@ -949,6 +1015,9 @@ def main(
                 / max(n_prompts, 1)
             ),
             "sdpo/is_ratio_mean": avg_is_ratio,
+            "sdpo/token_clip_fraction": token_clip_frac_running / max(n_micro, 1),
+            "sdpo/token_loss_pre_clip_mean": token_pre_clip_running / max(n_micro, 1),
+            "sdpo/token_loss_post_clip_mean": token_post_clip_running / max(n_micro, 1),
             "time/rollout_s": rollout_time,
             "time/train_s": train_time,
             "time/step_s": time.time() - step_t0,

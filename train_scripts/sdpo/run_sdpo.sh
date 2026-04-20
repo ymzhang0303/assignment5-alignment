@@ -86,6 +86,29 @@ case "$PG_APPLY_TO_ALL_SAMPLES" in
     *) echo "PG_APPLY_TO_ALL_SAMPLES must be 0/1" >&2; exit 1 ;;
 esac
 
+# OPSD-style ground-truth teacher (arXiv:2601.18734). When enabled, the
+# teacher conditions on the dataset's ground-truth answer instead of a
+# self-generated demo, giving 100% teacher-signal coverage.
+GT_TEACHER="${GT_TEACHER:-0}"
+case "$GT_TEACHER" in
+    1|true|True|TRUE|yes|on)  GT_TEACHER_FLAG="--gt-teacher" ;;
+    0|false|False|FALSE|no|off) GT_TEACHER_FLAG="--no-gt-teacher" ;;
+    *) echo "GT_TEACHER must be 0/1" >&2; exit 1 ;;
+esac
+
+# OPSD reference uses max_grad_norm=0.1 (much tighter than our 1.0 default)
+# and temperature=1.1 during rollouts (more diversity -> richer distillation).
+GRAD_CLIP="${GRAD_CLIP:-1.0}"
+SAMPLING_TEMPERATURE="${SAMPLING_TEMPERATURE:-1.0}"
+
+# OPSD per-token divergence clip. Their reference value is 0.05 for 1.7B/4B.
+# Empty or 'none' disables (our prior behaviour).
+TOKEN_CLIP="${TOKEN_CLIP:-}"
+TOKEN_CLIP_FLAGS=()
+if [[ -n "$TOKEN_CLIP" && "$TOKEN_CLIP" != "none" && "$TOKEN_CLIP" != "0" ]]; then
+    TOKEN_CLIP_FLAGS=(--token-clip "$TOKEN_CLIP")
+fi
+
 # Optional reprompt-template overrides (set REPROMPT_TEMPLATE / SOLUTION_TEMPLATE
 # to non-empty strings to override the SDPO defaults). The defaults live in
 # cs336_alignment/sdpo.py.
@@ -129,6 +152,10 @@ uv run python -m cs336_alignment.sdpo_train \
     $RTFD_FLAG \
     --min-demo-thinking-chars "$MIN_DEMO_THINKING_CHARS" \
     $PG_ALL_FLAG \
+    $GT_TEACHER_FLAG \
+    --grad-clip "$GRAD_CLIP" \
+    --sampling-temperature "$SAMPLING_TEMPERATURE" \
+    "${TOKEN_CLIP_FLAGS[@]}" \
     "${EXTRA_REPROMPT_FLAGS[@]}" \
     "$STD_NORM_FLAG" \
     --eval-every "$EVAL_EVERY" \
