@@ -66,6 +66,21 @@ case "$USE_STD_NORMALIZATION" in
     *) echo "USE_STD_NORMALIZATION must be 0/1, got: $USE_STD_NORMALIZATION" >&2; exit 1 ;;
 esac
 
+# Optional: AND (advantage > 0) into the PG response-mask so rollouts that
+# under-perform their group mean don't contribute to the policy-gradient
+# loss (mirror of SDPO's --adv-mask-distill, used to disentangle the
+# advantage-gate from the self-distillation term).
+ADV_MASK="${ADV_MASK:-0}"
+case "$ADV_MASK" in
+    1|true|True|TRUE|yes|on)  ADV_MASK_FLAG="--adv-mask" ;;
+    0|false|False|FALSE|no|off) ADV_MASK_FLAG="--no-adv-mask" ;;
+    *) echo "ADV_MASK must be 0/1, got: $ADV_MASK" >&2; exit 1 ;;
+esac
+
+# Optional cliprange override (default 0.2 in grpo_train). Mostly useful
+# when LOSS_TYPE=grpo_clip.
+CLIPRANGE="${CLIPRANGE:-0.2}"
+
 mkdir -p "$OUTPUT_DIR"
 
 uv run python -m cs336_alignment.grpo_train \
@@ -88,8 +103,10 @@ uv run python -m cs336_alignment.grpo_train \
     --sampling-max-tokens "$SAMPLING_MAX_TOKENS" \
     --epochs-per-rollout-batch "$EPOCHS_PER_ROLLOUT" \
     --loss-type "$LOSS_TYPE" \
+    --cliprange "$CLIPRANGE" \
     "${LENGTH_NORM_FLAGS[@]}" \
     "$STD_NORM_FLAG" \
+    "$ADV_MASK_FLAG" \
     --eval-every "$EVAL_EVERY" \
     --eval-examples "$EVAL_EXAMPLES" \
     --log-all-rollouts \

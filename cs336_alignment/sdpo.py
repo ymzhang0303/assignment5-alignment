@@ -85,6 +85,24 @@ def thinking_content_chars(text: str) -> int:
     return sum(len(m.strip()) for m in matches)
 
 
+def _demo_is_clean(resp: str, min_len: int, max_len: int) -> bool:
+    """Demo-structure quality filter (Round-11 experiment A).
+
+    Rejects rollouts whose response is not a clean think/answer pair:
+      - length outside ``[min_len, max_len]``, or
+      - missing a closed ``<think>...</think>`` block, or
+      - missing a closed ``<answer>...</answer>`` block.
+    """
+    n = len(resp)
+    if n < min_len or n > max_len:
+        return False
+    if "<think>" not in resp or "</think>" not in resp:
+        return False
+    if "<answer>" not in resp or "</answer>" not in resp:
+        return False
+    return True
+
+
 def pick_successful_demo(
     group_rewards: list[float],
     group_responses: list[str],
@@ -94,6 +112,9 @@ def pick_successful_demo(
     dont_reprompt_on_self_success: bool = True,
     remove_thinking_from_demonstration: bool = True,
     min_demo_thinking_chars: int = 0,
+    clean_demo_filter: bool = False,
+    clean_demo_min_len: int = 500,
+    clean_demo_max_len: int = 3000,
 ) -> Optional[str]:
     """Choose a successful demonstration from a rollout group.
 
@@ -133,6 +154,14 @@ def pick_successful_demo(
             j
             for j in candidate_idxs
             if thinking_content_chars(group_responses[j]) >= min_demo_thinking_chars
+        ]
+    if clean_demo_filter:
+        candidate_idxs = [
+            j
+            for j in candidate_idxs
+            if _demo_is_clean(
+                group_responses[j], clean_demo_min_len, clean_demo_max_len
+            )
         ]
     if not candidate_idxs:
         return None

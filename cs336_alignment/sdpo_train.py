@@ -353,6 +353,24 @@ def main(
             "siblings, training the teacher to also skip thinking."
         ),
     ),
+    clean_demo_filter: bool = typer.Option(
+        False,
+        help=(
+            "Round-11 A: additionally reject demos that don't have well-formed "
+            "<think>...</think><answer>...</answer> structure or whose length "
+            "is outside [clean_demo_min_len, clean_demo_max_len]."
+        ),
+    ),
+    clean_demo_min_len: int = typer.Option(500, help="See --clean-demo-filter."),
+    clean_demo_max_len: int = typer.Option(3000, help="See --clean-demo-filter."),
+    structure_adv_mask: bool = typer.Option(
+        False,
+        help=(
+            "Round-11 E: AND the positive-advantage distillation mask with "
+            "'rollout has closed <think>...</think><answer>...</answer>', so "
+            "distillation only fires on structurally clean positive samples."
+        ),
+    ),
     pg_apply_to_all_samples: bool = typer.Option(
         False,
         help=(
@@ -751,6 +769,9 @@ def main(
                             dont_reprompt_on_self_success=dont_reprompt_on_self_success,
                             remove_thinking_from_demonstration=remove_thinking_from_demonstration,
                             min_demo_thinking_chars=min_demo_thinking_chars,
+                            clean_demo_filter=clean_demo_filter,
+                            clean_demo_min_len=clean_demo_min_len,
+                            clean_demo_max_len=clean_demo_max_len,
                         )
                     )
 
@@ -780,6 +801,25 @@ def main(
             pos_adv = (advantages > 0).to(self_distillation_mask.dtype)
             mask_pre = self_distillation_mask.clone()
             self_distillation_mask = self_distillation_mask * pos_adv
+            if structure_adv_mask:
+                # Round-11 E: also require the *student's own rollout* to be
+                # structurally well-formed before we let the teacher pull on it.
+                struct_ok = torch.tensor(
+                    [
+                        1.0
+                        if (
+                            "<think>" in r
+                            and "</think>" in r
+                            and "<answer>" in r
+                            and "</answer>" in r
+                        )
+                        else 0.0
+                        for r in rollout_responses
+                    ],
+                    dtype=self_distillation_mask.dtype,
+                )
+                self_distillation_mask = self_distillation_mask * struct_ok
+                reward_meta["sdpo/structure_ok_frac"] = float(struct_ok.mean().item())
             denom = float(mask_pre.sum().clamp_min(1.0).item())
             reward_meta["sdpo/adv_mask_surviving_frac"] = float(
                 self_distillation_mask.sum().item() / denom

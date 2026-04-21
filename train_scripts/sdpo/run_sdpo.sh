@@ -118,6 +118,24 @@ case "$ADV_MASK_DISTILL" in
     *) echo "ADV_MASK_DISTILL must be 0/1" >&2; exit 1 ;;
 esac
 
+# Round-11 A: structural/length demo-quality filter.
+CLEAN_DEMO_FILTER="${CLEAN_DEMO_FILTER:-0}"
+case "$CLEAN_DEMO_FILTER" in
+    1|true|True|TRUE|yes|on)  CLEAN_DEMO_FLAG="--clean-demo-filter" ;;
+    0|false|False|FALSE|no|off) CLEAN_DEMO_FLAG="--no-clean-demo-filter" ;;
+    *) echo "CLEAN_DEMO_FILTER must be 0/1" >&2; exit 1 ;;
+esac
+CLEAN_DEMO_MIN_LEN="${CLEAN_DEMO_MIN_LEN:-500}"
+CLEAN_DEMO_MAX_LEN="${CLEAN_DEMO_MAX_LEN:-3000}"
+
+# Round-11 E: structure-aware advmask (require closed think+answer on rollout).
+STRUCTURE_ADV_MASK="${STRUCTURE_ADV_MASK:-0}"
+case "$STRUCTURE_ADV_MASK" in
+    1|true|True|TRUE|yes|on)  STRUCTURE_ADV_FLAG="--structure-adv-mask" ;;
+    0|false|False|FALSE|no|off) STRUCTURE_ADV_FLAG="--no-structure-adv-mask" ;;
+    *) echo "STRUCTURE_ADV_MASK must be 0/1" >&2; exit 1 ;;
+esac
+
 # Round-9 lean-D: Dr.GRPO-style per-token length penalty. Subtract
 # LENGTH_PENALTY * response_length_tokens from the raw reward before
 # advantage normalisation. 0 disables (default).
@@ -173,6 +191,10 @@ uv run python -m cs336_alignment.sdpo_train \
     "${EXTRA_REPROMPT_FLAGS[@]}" \
     "$STD_NORM_FLAG" \
     "$ADV_MASK_FLAG" \
+    "$CLEAN_DEMO_FLAG" \
+    --clean-demo-min-len "$CLEAN_DEMO_MIN_LEN" \
+    --clean-demo-max-len "$CLEAN_DEMO_MAX_LEN" \
+    "$STRUCTURE_ADV_FLAG" \
     --length-penalty "$LENGTH_PENALTY" \
     --eval-every "$EVAL_EVERY" \
     --eval-examples "$EVAL_EXAMPLES" \

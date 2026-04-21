@@ -38,6 +38,21 @@ R9_RUNS = [
     "strict_demo_advmask",
     "pgw5_tight_ema",
     "pgw5_nostd_advmask",
+    "pgw5_tokenclip_advmask",
+    "combo_BC_tokenclip",
+    "combo_BC_2ep",
+    "combo_BC_seed1",
+    "pgw5_advmask_seed1",
+    "strict_demo_BC",
+    "strict_demo_tokenclip",
+    "strict_demo_advmask_seed1",
+    "strict_pgw5_tokenclip",
+    "pgw5_tokenclip_seed1",
+    "pgw5_tokenclip_seed2",
+    "pgw5_advmask_alpha03",
+    "pgw5_tokenclip_tight",
+    "pgw5_gclip5",
+    "pgw5_hilr",
 ]
 
 
@@ -126,7 +141,10 @@ def main() -> None:
     any_winning = False
     any_promising = False
     for name in R9_RUNS:
-        s = summarize(load_val_rows(REPO / "runs" / f"sdpo_r9_{name}" / "metrics.jsonl"))
+        run_dir = REPO / "runs" / f"sdpo_r9_{name}"
+        if not run_dir.exists():
+            run_dir = REPO / "runs" / f"sdpo_r10_{name}"
+        s = summarize(load_val_rows(run_dir / "metrics.jsonl"))
         print(fmt_row(name, s, baseline_tail))
         if s is None:
             continue

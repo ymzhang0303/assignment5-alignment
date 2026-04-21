@@ -357,6 +357,17 @@ def main(
     ),
     cliprange: float = 0.2,
     grad_clip: float = 1.0,
+    adv_mask: bool = typer.Option(
+        False,
+        help=(
+            "If True, gate the per-sample policy-gradient contribution by "
+            "(advantage > 0): rollouts that under-perform their group mean "
+            "are excluded from both the numerator and denominator of the "
+            "masked_mean PG loss. Mirrors SDPO's --adv-mask-distill so we "
+            "can attribute gains from the advantage gate separately from "
+            "the self-distillation term."
+        ),
+    ),
     seed: int = 0,
     eval_every: int = 5,
     eval_examples: int = 1024,
@@ -598,6 +609,10 @@ def main(
             advantage_eps=advantage_eps,
             normalize_by_std=use_std_normalization,
         )
+        if adv_mask:
+            pos_adv = (advantages > 0).float()
+            reward_meta["grpo/adv_mask_surviving_frac"] = float(pos_adv.mean().item())
+            reward_meta["grpo/adv_mask_kept_samples"] = float(pos_adv.sum().item())
 
         # ---- 4. tokenize the rollout batch ---- #
         tokenized = tokenize_prompt_and_output(
@@ -654,6 +669,28 @@ def main(
                         if "old_log_probs" in micro
                         else None
                     )
+
+                    if adv_mask:
+                        # Drop non-positive-advantage samples entirely from
+                        # this micro. Mirrors SDPO's adv_mask_distill
+                        # (positive-advantage samples only contribute to the
+                        # policy gradient). We slice rather than zero out
+                        # the response_mask because ``grpo_microbatch_train_step``
+                        # reduces with a per-example ``masked_mean(dim=-1)``,
+                        # which would otherwise emit 0/0 = NaN for any fully
+                        # gated row and contaminate the entire backward pass.
+                        keep = (adv_kw.squeeze(-1) > 0)
+                        if not bool(keep.any().item()):
+                            continue
+                        input_ids = input_ids[keep]
+                        labels = labels[keep]
+                        response_mask = response_mask[keep]
+                        log_probs = log_probs[keep]
+                        token_entropy = token_entropy[keep]
+                        raw_kw = raw_kw[keep]
+                        adv_kw = adv_kw[keep]
+                        if old_kw is not None:
+                            old_kw = old_kw[keep]
 
                     loss, meta = grpo_microbatch_train_step(
                         policy_log_probs=log_probs,

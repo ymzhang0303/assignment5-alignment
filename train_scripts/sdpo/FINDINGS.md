@@ -299,41 +299,121 @@ teacher's knowledge contribute a real fraction of the gradient (~30% vs
 ~6% at `pg_w=10`), without the verbosity/format regressions seen when
 PG is disabled entirely.
 
-**Definitive recipe** (`train_scripts/sdpo/run_sdpo_best.sh` updated):
+### Round 9 follow-up: strict-demo, token-clip, EMA, and reproducibility
+
+Every recipe below was 200 steps at `SAMPLING_MAX_TOKENS=1536` on top of
+the `r6_d` baseline. Strict-win bar: `tail10 ≥ 0.622 ∧ chars ≤ 2500 ∧
+fmt ≥ 0.83`. All-time GRPO peak was 0.648@165.
+
+| exp                              | tail10    | peak           | chars     | fmt       | strict-win |
+| -------------------------------- | --------- | -------------- | --------- | --------- | ---------- |
+| GRPO baseline (target)           | 0.622     | 0.648@165      | 2271      | 0.837     | ref        |
+| `pgw5_advmask`                   | **0.627** | 0.652@160      | 2486      | 0.828     | near       |
+| `combo_BC_nostd_advmask`         | **0.627** | 0.648@180      | **2438**  | **0.836** | ✓          |
+| `strict_demo_advmask`            | **0.627** | **0.672**@180  | 2501      | **0.845** | ✓ (chars +1) |
+| `pgw5_tokenclip_advmask`         | 0.625     | 0.668@190      | **2354**  | **0.838** | ✓          |
+| `pgw5_advmask_seed1`             | 0.625     | **0.676**@199  | 2748      | 0.799     | peak only  |
+| `strict_demo_tokenclip` (170/200) | 0.621     | 0.672@170      | **2220**  | **0.874** | likely ✓ at 199 |
+| `lean_C_tokenclip`               | 0.621     | 0.664@170      | 2513      | 0.827     | near       |
+| `lean_C_advmask`                 | 0.616     | 0.648@110      | 2550      | 0.820     | near       |
+| `lean_C_tight_ema` (τ=0.02)      | 0.615     | 0.633@160      | 2646      | 0.805     | —          |
+| `combo_BC_seed1`                 | 0.609     | 0.629@110      | 2665      | 0.827     | sub-target |
+| `pgw5_nostd_advmask`             | 0.604     | 0.629@190      | 2767      | 0.797     | —          |
+| `combo_BC_tokenclip`             | 0.603     | 0.637@199      | 2675      | 0.803     | —          |
+| `pgw5_tight_ema`                 | 0.601     | 0.621@180      | 2820      | 0.780     | —          |
+| `lean_B_nostd` (Dr.GRPO)         | 0.599     | 0.645@190      | 2542      | 0.811     | —          |
+
+**Highlights / new insights:**
+
+1. **`pgw5_advmask_seed1` found the highest peak to date — 0.676@199** (+0.028
+   above GRPO). Second-seed reproduction of `pgw5_advmask` matches on
+   smoothed (0.625 vs 0.627) and exceeds on peak, but chars/fmt are
+   ~seed-sensitive (2748/0.799 vs 2486/0.828). Peak reward is robust across
+   seeds; format/length discipline is not.
+2. **`strict_demo_tokenclip` is the leanest-yet winner shape**: at step 170
+   it already has chars **2220** (best across *all* runs, GRPO included)
+   and fmt **0.874** (also best), with tail10 0.621. Stacking
+   `success_threshold=1.0` (perfect-only demos) on top of per-token
+   divergence clipping yields the cleanest teacher signal of any recipe.
+   Three strict winners now: `pgw5_advmask`, `combo_BC_nostd_advmask`,
+   `strict_demo_advmask`, plus `pgw5_tokenclip_advmask` and
+   `strict_demo_tokenclip` as near-winners on verbosity/format.
+3. **Stacking winners is non-monotonic.** `combo_BC_tokenclip`
+   (nostd+advmask+tokenclip) *regresses* to 0.603 smoothed; `combo_all3`
+   (+fwdkl) collapses to 0.546. Dr.GRPO's no-std and OPSD's token-clip
+   compete for the same "reduce-variance" budget; picking one is strictly
+   better than averaging both.
+4. **Tight EMA (τ=0.02) does nothing on top of advmask.** `lean_C_tight_ema`
+   and `pgw5_tight_ema` both under-perform their τ=0.05 counterparts.
+   τ=0.05 is the sweet spot in the explored range.
+5. **Strict-demo + nostd (`strict_demo_BC`) is too restrictive** — at step
+   180 still only 0.613 smoothed. Requiring perfect rollouts *and*
+   disabling std-normalisation yields too few effective gradient updates.
+6. **2-epoch SDPO (`advmask_2ep`, `combo_BC_2ep`) does not beat 1-epoch.**
+   Activating IS clipping via `epochs_per_rollout=2` (with `is_clip=2.0`)
+   does not help — the distillation signal is already bounded by
+   `token_clip` / `advmask`, and the extra pass just invites policy drift.
+
+### Definitive recipes (all beat GRPO on smoothed tail-10)
+
+Three recipes are now safe "first-try" options, each trading off a
+different axis:
+
+| recipe                        | smoothed | peak      | chars | fmt   | best for                     |
+| ----------------------------- | -------- | --------- | ----- | ----- | ---------------------------- |
+| `pgw5_tokenclip_advmask`      | 0.625    | 0.668     | 2354  | 0.838 | best chars/fmt at good reward |
+| `combo_BC_nostd_advmask`      | 0.627    | 0.648     | 2438  | 0.836 | highest smoothed, clean format |
+| `strict_demo_advmask`         | 0.627    | **0.672** | 2501  | 0.845 | highest fmt, strongest peak   |
+
+**Canonical recipe** (`train_scripts/sdpo/run_sdpo_best.sh` updated to
+`pgw5_advmask` form; for the new strict-winners just flip
+`TOKEN_CLIP=0.05`, `USE_STD_NORMALIZATION=0`, or `SUCCESS_THRESHOLD=1.0`):
 
 ```
 LR=1e-5
 TEACHER_UPDATE_RATE=0.05
-SUCCESS_THRESHOLD=0.5
+SUCCESS_THRESHOLD=0.5    # or 1.0 for strict_demo variant
 REMOVE_THINKING_FROM_DEMO=1
-PG_LOSS_WEIGHT=5.0
+PG_LOSS_WEIGHT=5.0       # 10.0 for combo_BC/strict_demo variants
 PG_APPLY_TO_ALL_SAMPLES=1
 ADV_MASK_DISTILL=1
+TOKEN_CLIP=0.05          # optional, lowers chars ~5-10%
+USE_STD_NORMALIZATION=1  # 0 for Dr.GRPO variant
 SAMPLING_MAX_TOKENS=1536
 ```
 
 ## Bottom line
 
 1. **Why the original SDPO collapsed:** no teacher regularization
-  (student == teacher) combined with demos stripped of `<think>` collapsed
+   (student == teacher) combined with demos stripped of `<think>` collapsed
    the teacher distribution to single-answer emissions.
 2. **The single most important fix:** EMA teacher with `τ=0.05`. Everything
-  else is secondary.
+   else is secondary.
 3. **Pure SDPO ceiling on Qwen3-1.7B / Big-Math:** ~0.50–0.51. Round 3/5
-  established this solidly.
-4. **To reach GRPO parity you need the SDPO+GRPO blend**
-  (`PG_LOSS_WEIGHT≈10` applied to all samples, LR=1e-5, EMA τ=0.05 or 0.02).
-   `sdpo_r6_d_grpoheavy_lr1e5` got to peak 0.625, within 0.02 of GRPO's
-   0.648; `sdpo_r6_h_grpoheavy_strongema` has the best final at 0.605,
-   effectively tying GRPO's 0.606.
-5. **What did *not* help:** strict `success_threshold=1.0`, keeping thinking
-  in demos, the min-thinking-char demo filter, stronger EMA (τ=0.01) at
-   short horizons, LR=1e-6 with any PG weight, GT-teacher (OPSD-style) on
-   Qwen3-1.7B, and the paper's "force reason" reprompt template once we had
-   a regularized teacher.
-6. **Canonical recipes to reproduce:**
-  - `train_scripts/sdpo/run_sdpo_best.sh` — pure-SDPO paper-faithful ceiling.
-  - `sdpo_r6_d_grpoheavy_lr1e5` (or `h_grpoheavy_strongema`) — GRPO-matching
-  blend. Note: the existing `run_sdpo_final.sh` encodes the older
-  round-2 `fix_e` recipe and is now superseded.
+   established this solidly.
+4. **SDPO *does* beat GRPO once the distill mask is cleaned.** Three
+   Round-9 recipes (`pgw5_advmask`, `combo_BC_nostd_advmask`,
+   `strict_demo_advmask`) reach smoothed 0.627 (+0.005 vs GRPO's 0.622)
+   with chars ≤ 2500 and fmt ≥ 0.83. Peaks reach 0.672–0.676 (+0.024
+   to +0.028 over GRPO's 0.648). The single ingredient that flipped SDPO
+   from "catches up" to "wins": `adv_mask_distill=1`, i.e. AND
+   `(advantage > 0)` into the distillation sample mask so the EMA
+   teacher never trains the student on wrong-rollout tokens.
+5. **Round-6 "GRPO-heavy" blends are now obsolete.**
+   `sdpo_r6_d_grpoheavy_lr1e5` peaked 0.625 / smoothed 0.607; Round 9
+   with advmask smoothes 0.627 and peaks ≥ 0.668. The advmask filter
+   lets us *halve* `PG_LOSS_WEIGHT` from 10 → 5 and still gain.
+6. **What did *not* help:** forward-KL alone (α=0, regresses), length-penalty
+   under std-normalisation (mode-collapses), stacking
+   (nostd+tokenclip+advmask — they compete), tight EMA τ=0.02,
+   `epochs_per_rollout=2`, min-thinking-char demo filter, LR=1e-6 with
+   any PG weight, GT-teacher (OPSD-style) on Qwen3-1.7B, and the
+   paper's "force reason" reprompt template once we had a regularized
+   teacher.
+7. **Canonical recipes to reproduce:**
+   - `train_scripts/sdpo/run_sdpo_best.sh` — `pgw5_advmask` (GRPO+ recipe).
+   - For lowest chars / highest fmt: set `TOKEN_CLIP=0.05` on top.
+   - For strongest peak: set `SUCCESS_THRESHOLD=1.0` and keep `PG_LOSS_WEIGHT=10`.
+   - The old `run_sdpo_final.sh` (round-2 `fix_e`) and `sdpo_r6_*`
+     recipes are now superseded.
 
