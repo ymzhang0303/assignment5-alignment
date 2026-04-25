@@ -1053,20 +1053,182 @@ def extract_answer(passage: str) -> str:
     return None
 
 
-def grade(model_answer: str, gt_answer: str, fast: bool = True):
+# ---------------------------------------------------------------------------
+# Unicode/LaTeX equivalence helpers (used by `grade` to recover false
+# negatives where the model emits Unicode math glyphs, the GT has a trailing
+# `\approx <decimal> <unit>` clause, or the GT uses `\text{and}`/`\text{or}`
+# connectors to list multiple acceptable answers).
+# ---------------------------------------------------------------------------
+
+# Common Unicode math glyphs → LaTeX. Applied to both the model answer and
+# the ground truth symmetrically, so rewrites that make both sides look the
+# same do not introduce false positives on their own.
+_UNICODE_MATH_MAP = {
+    "∞": r"\infty ",
+    "√": r"\sqrt ",
+    "×": r"\times ",
+    "·": r"\cdot ",
+    "⋅": r"\cdot ",
+    "−": "-",   # U+2212 minus
+    "π": r"\pi ",
+    "α": r"\alpha ", "β": r"\beta ", "γ": r"\gamma ", "δ": r"\delta ",
+    "θ": r"\theta ", "λ": r"\lambda ", "μ": r"\mu ", "ρ": r"\rho ",
+    "σ": r"\sigma ", "φ": r"\phi ", "ω": r"\omega ",
+    "≤": r"\leq ", "≥": r"\geq ", "≠": r"\ne ", "≈": r"\approx ",
+    "°": r"^\circ ",
+}
+
+
+def _normalize_unicode_math(s: str) -> str:
+    if not isinstance(s, str):
+        return s
+    for k, v in _UNICODE_MATH_MAP.items():
+        if k in s:
+            s = s.replace(k, v)
+    return s
+
+
+# `\text{ and }`, `\text{and}`, `\text{ or }`, `\text{,}`, `\text{ et }`, etc.
+_TEXT_CONNECTOR_RE = re.compile(
+    r"\\text\s*\{\s*(?:and|or|et|,|;|和|或)\s*\}"
+)
+
+# Trailing `\approx <rest-of-string>` on the GT side.
+_APPROX_TAIL_RE = re.compile(r"\s*\\approx\b.*$", re.DOTALL)
+
+# Trailing `\text{<unit>}` / `\,\text{<unit>}` clauses on the GT side.
+_TRAILING_UNIT_RE = re.compile(
+    r"\s*(?:\\,|~)?\s*\\text\s*\{[^}]*\}\s*$"
+)
+
+
+def _strip_text_connectors(s: str) -> str:
+    return _TEXT_CONNECTOR_RE.sub(", ", s)
+
+
+def _strip_approx_tail(s: str) -> str:
+    return _APPROX_TAIL_RE.sub("", s).rstrip()
+
+
+def _strip_trailing_unit(s: str) -> str:
+    prev = None
+    while prev != s:
+        prev = s
+        s = _TRAILING_UNIT_RE.sub("", s).rstrip()
+    return s
+
+
+def _split_top_level_list(s: str) -> list:
+    """Split on `,` or `;` at the top level (ignoring brackets/braces)."""
+    parts = []
+    depth = 0
+    cur = []
+    for ch in s:
+        if ch in "([{":
+            depth += 1
+            cur.append(ch)
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+            cur.append(ch)
+        elif ch in ",;" and depth == 0:
+            parts.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        parts.append("".join(cur).strip())
+    return [p for p in parts if p]
+
+
+def _grade_core(model_answer: str, gt_answer: str, fast: bool) -> bool:
+    """The original mathd + sympy (+ math_verify) grading path."""
+    if gt_answer is None or model_answer is None:
+        return False
     if "\\boxed" in gt_answer:
-        gt_answer = extract_answer(gt_answer)
+        extracted = extract_answer(gt_answer)
+        if extracted is not None:
+            gt_answer = extracted
+    if gt_answer is None:
+        return False
     correct = grade_answer_mathd(model_answer, gt_answer) or grade_answer_sympy(
         model_answer, gt_answer
     )
     if not fast:
-        # This mode further uses math_verify to recall originally false positives.
-        # Will be a bit slower, and sensitive to bad inputs.
-        correct = correct or is_latex_equal(
-            model_answer,
-            gt_answer,
-        )
+        correct = correct or is_latex_equal(model_answer, gt_answer)
     return correct
+
+
+def grade(model_answer: str, gt_answer: str, fast: bool = True):
+    """Strictly additive wrapper around the original mathd/sympy grader.
+
+    All new branches can only turn a `False` into a `True`; the original
+    grading path is always attempted first on the raw inputs so behaviour is
+    preserved for everything that already worked.
+    """
+    if model_answer is None or gt_answer is None:
+        return False
+
+    if _grade_core(model_answer, gt_answer, fast):
+        return True
+
+    # Unicode math glyph normalization on both sides.
+    m = _normalize_unicode_math(model_answer)
+    g = _normalize_unicode_math(gt_answer)
+    if (m, g) != (model_answer, gt_answer):
+        if _grade_core(m, g, fast):
+            return True
+
+    # Strip a trailing `\approx <decimal> <unit>` clause from the GT.
+    g_approx = _strip_approx_tail(g)
+    if g_approx != g and _grade_core(m, g_approx, fast):
+        return True
+
+    # Strip a trailing `\text{<unit>}` from the GT (e.g. `7\pi \text{cm}^2`
+    # -> `7\pi ^2` -- leaves exponents alone; not a unit normalizer, just a
+    # last-chance fallback).
+    g_nounit = _strip_trailing_unit(g_approx)
+    if g_nounit != g_approx and _grade_core(m, g_nounit, fast):
+        return True
+
+    # `\text{and}/\text{or}/\text{,}` -> comma. Try the whole form first, then
+    # treat the GT as an unordered list of acceptable answers.
+    g_listform = _strip_text_connectors(g_nounit)
+    m_listform = _strip_text_connectors(m)
+    if g_listform != g_nounit or m_listform != m:
+        if _grade_core(m_listform, g_listform, fast):
+            return True
+
+    gt_elems = _split_top_level_list(g_listform)
+    if len(gt_elems) > 1:
+        ma_elems = _split_top_level_list(m_listform)
+
+        # Case A: model collapsed the elements (e.g. `①④` for `① and ④`).
+        if len(ma_elems) <= 1:
+            joined = "".join(gt_elems)
+            if _grade_core(m_listform, joined, fast):
+                return True
+            # Also try with a space between elements.
+            if _grade_core(m_listform, " ".join(gt_elems), fast):
+                return True
+
+        # Case B: model emitted the same list (order-independent match).
+        if len(ma_elems) == len(gt_elems) >= 2:
+            matched = [False] * len(gt_elems)
+            all_ok = True
+            for ma_el in ma_elems:
+                found = False
+                for j, gt_el in enumerate(gt_elems):
+                    if not matched[j] and _grade_core(ma_el, gt_el, fast):
+                        matched[j] = True
+                        found = True
+                        break
+                if not found:
+                    all_ok = False
+                    break
+            if all_ok and all(matched):
+                return True
+
+    return False
 
 
 def r1_zero_reward_fn(response, ground_truth, fast=True):
